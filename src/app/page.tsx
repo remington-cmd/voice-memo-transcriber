@@ -81,7 +81,8 @@ export default function Home() {
       "output.mp3",
     ]);
 
-    const data = await ffmpeg.readFile("output.mp3");
+    const raw = await ffmpeg.readFile("output.mp3");
+    const data = raw instanceof Uint8Array ? new Uint8Array(raw) : new TextEncoder().encode(raw as string);
     return new File([data], input.name.replace(/\.[^.]+$/, ".mp3"), { type: "audio/mpeg" });
   }
 
