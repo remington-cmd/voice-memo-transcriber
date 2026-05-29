@@ -1,33 +1,32 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import { useDropzone } from "react-dropzone";
+import { chunkAudioFile } from "./audio-chunker";
 
-const MAX_DROPZONE = 500 * 1024 * 1024; // 500 MB — no frontend gate; server handles via compression
-const WHISPER_LIMIT = 24 * 1024 * 1024; // compress anything over 24 MB before upload
+// Files at/under this size are sent straight to Whisper. Larger files are
+// decoded and split into chunks in the browser first.
+const DIRECT_LIMIT = 24 * 1024 * 1024;
+// Hard cap on what we'll even attempt to load into memory for chunking.
+const MAX_SIZE = 500 * 1024 * 1024;
 
 interface Result {
   filename: string;
   transcript: string;
-  duration?: number;
-  language?: string;
   at: Date;
 }
 
-type Status = "idle" | "compressing" | "transcribing" | "error";
-
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
-  const [status, setStatus] = useState<Status>("idle");
+  const [status, setStatus] = useState<"idle" | "working" | "error">("idle");
+  const [progress, setProgress] = useState<string>("");
   const [results, setResults] = useState<Result[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<number | null>(null);
-  const [progress, setProgress] = useState("");
-  const ffmpegRef = useRef<import("@ffmpeg/ffmpeg").FFmpeg | null>(null);
 
   const onDrop = useCallback((accepted: File[], rejected: { file: File }[]) => {
     if (rejected.length > 0) {
-      setError("Unsupported file type. Use .m4a, .mp3, .wav, or .mp4.");
+      setError("File too large (max 500 MB) or unsupported type. Use .m4a, .mp3, .wav, .mp4, .ogg.");
       return;
     }
     setError(null);
@@ -46,84 +45,59 @@ export default function Home() {
       "audio/ogg": [".ogg"],
       "video/mp4": [".mp4"],
     },
-    maxSize: MAX_DROPZONE,
+    maxSize: MAX_SIZE,
     maxFiles: 1,
-    disabled: status === "compressing" || status === "transcribing",
+    disabled: status === "working",
   });
 
-  async function compress(input: File): Promise<File> {
-    setStatus("compressing");
-    setProgress("Loading audio processor… (~10 s first time)");
-
-    const { FFmpeg } = await import("@ffmpeg/ffmpeg");
-    const { fetchFile, toBlobURL } = await import("@ffmpeg/util");
-
-    if (!ffmpegRef.current) {
-      const ffmpeg = new FFmpeg();
-      const base = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
-      await ffmpeg.load({
-        coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm"),
-      });
-      ffmpegRef.current = ffmpeg;
-    }
-
-    const ffmpeg = ffmpegRef.current;
-    setProgress("Compressing… (16 kHz mono — takes ~15–30 s)");
-
-    const ext = input.name.split(".").pop() ?? "m4a";
-    await ffmpeg.writeFile(`input.${ext}`, await fetchFile(input));
-    await ffmpeg.exec([
-      "-i", `input.${ext}`,
-      "-ar", "16000",
-      "-ac", "1",
-      "-b:a", "32k",
-      "output.mp3",
-    ]);
-
-    const raw = await ffmpeg.readFile("output.mp3");
-    const data = raw instanceof Uint8Array ? new Uint8Array(raw) : new TextEncoder().encode(raw as string);
-    return new File([data], input.name.replace(/\.[^.]+$/, ".mp3"), { type: "audio/mpeg" });
+  async function transcribeBlob(blob: Blob, filename: string): Promise<string> {
+    const fd = new FormData();
+    fd.append("file", blob, filename);
+    const res = await fetch("/api/transcribe", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error ?? "Transcription failed");
+    return data.transcript as string;
   }
 
-  async function transcribe() {
+  async function run() {
     if (!file) return;
+    setStatus("working");
     setError(null);
 
-    let uploadFile = file;
-    if (file.size > WHISPER_LIMIT) {
-      try {
-        uploadFile = await compress(file);
-      } catch {
-        setError("Compression failed. Try a smaller file or convert to MP3 first.");
-        setStatus("error");
-        return;
-      }
-    }
-
-    setStatus("transcribing");
-    setProgress("");
-
-    const fd = new FormData();
-    fd.append("file", uploadFile);
-
     try {
-      const res = await fetch("/api/transcribe", { method: "POST", body: fd });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error ?? "Transcription failed");
-        setStatus("error");
-        return;
+      let fullTranscript: string;
+
+      if (file.size <= DIRECT_LIMIT) {
+        // Small enough — send the original file directly.
+        setProgress("Transcribing…");
+        fullTranscript = await transcribeBlob(file, file.name);
+      } else {
+        // Large file — split into chunks in the browser, transcribe each.
+        setProgress("Preparing audio (splitting into chunks)…");
+        const chunks = await chunkAudioFile(file);
+        const parts: string[] = [];
+        for (const chunk of chunks) {
+          setProgress(`Transcribing chunk ${chunk.index + 1} of ${chunks.length}…`);
+          const text = await transcribeBlob(
+            chunk.blob,
+            `${file.name}.part${chunk.index + 1}.wav`
+          );
+          parts.push(text.trim());
+        }
+        fullTranscript = parts.join("\n\n");
       }
+
       setResults((prev) => [
-        { filename: file.name, transcript: data.transcript, duration: data.duration, language: data.language, at: new Date() },
+        { filename: file.name, transcript: fullTranscript, at: new Date() },
         ...prev,
       ]);
       setFile(null);
       setStatus("idle");
-    } catch {
-      setError("Network error. Check your connection.");
+      setProgress("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong.");
       setStatus("error");
+      setProgress("");
     }
   }
 
@@ -140,17 +114,13 @@ export default function Home() {
     a.click();
   }
 
-  function fmt(s: number) {
-    return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
-  }
-
-  const busy = status === "compressing" || status === "transcribing";
-
   return (
     <main style={{ maxWidth: 720, margin: "0 auto", padding: "48px 24px" }}>
       <div style={{ marginBottom: 40 }}>
         <h1 style={{ fontSize: 32, fontWeight: 700, margin: 0 }}>🎙 Voice Memo Transcriber</h1>
-        <p style={{ color: "#999", marginTop: 8 }}>Drop an audio file and get a full transcript. Large files are compressed automatically.</p>
+        <p style={{ color: "#999", marginTop: 8 }}>
+          Drop an audio file — voice memos, podcasts, conference recordings — and get a full transcript. Long files are split and transcribed automatically.
+        </p>
       </div>
 
       <div
@@ -163,18 +133,18 @@ export default function Home() {
           cursor: "pointer",
           background: isDragActive ? "rgba(79,142,247,0.05)" : "#1a1a1a",
           transition: "all 0.2s",
-          opacity: busy ? 0.5 : 1,
+          opacity: status === "working" ? 0.5 : 1,
         }}
       >
         <input {...getInputProps()} />
         <div style={{ fontSize: 40, marginBottom: 12 }}>🎵</div>
         <p style={{ margin: 0, color: "#ccc", fontWeight: 500 }}>
-          {isDragActive ? "Drop it here…" : "Drag & drop your voice memo here"}
+          {isDragActive ? "Drop it here…" : "Drag & drop your audio file here"}
         </p>
         <p style={{ margin: "8px 0 16px", color: "#555", fontSize: 14 }}>
-          .m4a · .mp3 · .wav · .mp4 · any size (large files compressed in-browser)
+          .m4a · .mp3 · .wav · .mp4 · .ogg · up to 500 MB
         </p>
-        <button style={btnStyle("outline")}>Browse files</button>
+        <button style={btn("outline")}>Browse files</button>
       </div>
 
       {error && (
@@ -187,20 +157,22 @@ export default function Home() {
         <div style={{ marginTop: 16, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", background: "#1a1a1a", border: "1px solid #333", borderRadius: 8 }}>
           <div>
             <p style={{ margin: 0, fontWeight: 500, fontSize: 14 }}>{file.name}</p>
-            <p style={{ margin: 0, color: "#666", fontSize: 12 }}>
-              {(file.size / 1024 / 1024).toFixed(1)} MB
-              {file.size > WHISPER_LIMIT && <span style={{ color: "#f59e0b", marginLeft: 8 }}>will compress before upload</span>}
-            </p>
-            {progress && <p style={{ margin: "4px 0 0", color: "#4f8ef7", fontSize: 12 }}>{progress}</p>}
+            <p style={{ margin: 0, color: "#666", fontSize: 12 }}>{(file.size / 1024 / 1024).toFixed(1)} MB</p>
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            {!busy && (
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            {status !== "working" && (
               <button onClick={() => setFile(null)} style={{ background: "none", border: "none", color: "#666", cursor: "pointer", fontSize: 18, lineHeight: 1 }}>×</button>
             )}
-            <button onClick={transcribe} disabled={busy} style={btnStyle("primary")}>
-              {status === "compressing" ? "Compressing…" : status === "transcribing" ? "Transcribing…" : "Transcribe"}
+            <button onClick={run} disabled={status === "working"} style={btn("primary")}>
+              {status === "working" ? "Working…" : "Transcribe"}
             </button>
           </div>
+        </div>
+      )}
+
+      {status === "working" && progress && (
+        <div style={{ marginTop: 12, padding: "10px 16px", background: "#15203a", border: "1px solid #243a66", borderRadius: 8, color: "#9dc0ff", fontSize: 13 }}>
+          {progress}
         </div>
       )}
 
@@ -212,15 +184,13 @@ export default function Home() {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", padding: "14px 16px", background: "#1a1a1a" }}>
                 <div>
                   <p style={{ margin: 0, fontWeight: 500, fontSize: 14 }}>{r.filename}</p>
-                  <p style={{ margin: 0, color: "#666", fontSize: 12, marginTop: 2 }}>
-                    {r.at.toLocaleString()}{r.duration ? ` · ${fmt(r.duration)}` : ""}{r.language ? ` · ${r.language}` : ""}
-                  </p>
+                  <p style={{ margin: 0, color: "#666", fontSize: 12, marginTop: 2 }}>{r.at.toLocaleString()}</p>
                 </div>
                 <div style={{ display: "flex", gap: 8 }}>
-                  <button onClick={() => copy(r.transcript, i)} style={btnStyle("outline")}>
+                  <button onClick={() => copy(r.transcript, i)} style={btn("outline")}>
                     {copied === i ? "✓ Copied" : "Copy"}
                   </button>
-                  <button onClick={() => download(r)} style={btnStyle("outline")}>↓ .txt</button>
+                  <button onClick={() => download(r)} style={btn("outline")}>↓ .txt</button>
                 </div>
               </div>
               <div style={{ padding: "16px", background: "#111", fontSize: 14, lineHeight: 1.7, whiteSpace: "pre-wrap", maxHeight: 400, overflowY: "auto", color: "#ddd" }}>
@@ -232,13 +202,13 @@ export default function Home() {
       )}
 
       <div style={{ marginTop: 40, padding: "16px", border: "1px dashed #333", borderRadius: 8, fontSize: 13, color: "#666" }}>
-        <strong style={{ color: "#999" }}>From your iPhone:</strong> Voice Memos → tap recording → ··· → Share → Save to Files. Then open this page and tap Browse files.
+        <strong style={{ color: "#999" }}>Tip:</strong> For Spotify/podcast audio, record it with Audacity (Mac: BlackHole, Windows: WASAPI loopback) and export an .mp3 — then drop it here. Long files transcribe in 5-minute chunks automatically.
       </div>
     </main>
   );
 }
 
-function btnStyle(variant: "primary" | "outline"): React.CSSProperties {
+function btn(variant: "primary" | "outline"): React.CSSProperties {
   return variant === "primary"
     ? { background: "#4f8ef7", color: "#fff", border: "none", borderRadius: 6, padding: "8px 16px", cursor: "pointer", fontWeight: 500, fontSize: 14 }
     : { background: "none", color: "#ccc", border: "1px solid #444", borderRadius: 6, padding: "6px 14px", cursor: "pointer", fontSize: 13 };
