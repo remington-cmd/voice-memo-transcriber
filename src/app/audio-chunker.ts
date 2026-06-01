@@ -3,7 +3,10 @@
 // and splits it into fixed-length WAV chunks small enough for the 25 MB API limit.
 
 const TARGET_SAMPLE_RATE = 16000; // Whisper internally works at 16 kHz
-const CHUNK_SECONDS = 300; // 5 minutes per chunk (~9.6 MB as 16 kHz mono WAV)
+// 2 minutes per chunk. As 16 kHz mono 16-bit WAV this is ~3.8 MB, which stays
+// safely under Vercel's ~4.5 MB serverless request body limit (and Whisper's
+// 25 MB cap). Shorter chunks = more requests but reliable uploads.
+const CHUNK_SECONDS = 120;
 
 export interface AudioChunk {
   blob: Blob;
