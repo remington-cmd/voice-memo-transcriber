@@ -11,6 +11,14 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  const accessPassword = process.env.ACCESS_PASSWORD;
+  if (accessPassword) {
+    const provided = request.headers.get("x-access-password") ?? "";
+    if (provided !== accessPassword) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+  }
+
   let formData: FormData;
   try {
     formData = await request.formData();
