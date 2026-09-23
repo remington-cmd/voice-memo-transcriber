@@ -1,12 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { useDropzone } from "react-dropzone";
+import { useDropzone, type FileRejection } from "react-dropzone";
 import { chunkAudioFile } from "./audio-chunker";
 
 const DIRECT_LIMIT = 24 * 1024 * 1024;
 const MAX_SIZE = 500 * 1024 * 1024;
 const LS_KEY = "vmt_results";
+const ALLOWED_EXTENSIONS = [".m4a", ".mp3", ".wav", ".mp4", ".ogg", ".webm", ".aac", ".caf"];
 
 interface Result {
   filename: string;
@@ -46,9 +47,24 @@ export default function Home() {
     }
   }, [results, password]);
 
-  const onDrop = useCallback((accepted: File[], rejected: { file: File }[]) => {
+  const onDrop = useCallback((accepted: File[], rejected: FileRejection[]) => {
     if (rejected.length > 0) {
-      setError("File too large (max 500 MB) or unsupported type. Use .m4a, .mp3, .wav, .mp4, .ogg.");
+      const codes = new Set(rejected[0].errors.map((e) => e.code));
+      if (codes.has("file-too-large")) {
+        setError(
+          `"${rejected[0].file.name}" is too large — max 500 MB (this file is ${(
+            rejected[0].file.size /
+            1024 /
+            1024
+          ).toFixed(0)} MB).`
+        );
+      } else if (codes.has("too-many-files")) {
+        setError("Only one file at a time — drop a single audio file.");
+      } else {
+        setError(
+          `"${rejected[0].file.name}" isn't a recognized audio/video file type. Use ${ALLOWED_EXTENSIONS.join(", ")}.`
+        );
+      }
       return;
     }
     setError(null);
@@ -58,14 +74,14 @@ export default function Home() {
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    accept: {
-      "audio/x-m4a": [".m4a"],
-      "audio/mp4": [".mp4", ".m4a"],
-      "audio/mpeg": [".mp3"],
-      "audio/wav": [".wav"],
-      "audio/webm": [".webm"],
-      "audio/ogg": [".ogg"],
-      "video/mp4": [".mp4"],
+    // No `accept` MIME filter here on purpose: browsers/OSes report wildly
+    // inconsistent MIME types for .m4a (audio/x-m4a, audio/m4a, audio/mp4a-latm,
+    // or "" for files exported by tools like iMazing), which caused valid
+    // short recordings to be rejected as "unsupported type". Extension is
+    // checked explicitly below instead, which is reliable across platforms.
+    validator: (f) => {
+      const ok = ALLOWED_EXTENSIONS.some((ext) => f.name.toLowerCase().endsWith(ext));
+      return ok ? null : { code: "file-invalid-type", message: "Unsupported file extension" };
     },
     maxSize: MAX_SIZE,
     maxFiles: 1,
