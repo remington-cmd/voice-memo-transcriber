@@ -4,7 +4,15 @@ import { useCallback, useEffect, useState } from "react";
 import { useDropzone, type FileRejection } from "react-dropzone";
 import { chunkAudioFile } from "./audio-chunker";
 
-const DIRECT_LIMIT = 24 * 1024 * 1024;
+// Vercel hard-caps serverless function request bodies at ~4.5 MB (this is a
+// platform limit, not something Next.js config can raise) — the request is
+// rejected before it ever reaches our route handler. This must stay under
+// that cap, NOT Whisper's unrelated 25 MB per-file API limit; the previous
+// 24 MB value here confused the two, so any file in the 4.5–24 MB range
+// bypassed client-side chunking and got a raw platform 413 instead of a
+// transcript. Keep this aligned with audio-chunker.ts's own ~3.8 MB/chunk
+// target, which already assumes the same 4.5 MB ceiling.
+const DIRECT_LIMIT = 4 * 1024 * 1024;
 const MAX_SIZE = 500 * 1024 * 1024;
 const LS_KEY = "vmt_results";
 const ALLOWED_EXTENSIONS = [".m4a", ".mp3", ".wav", ".mp4", ".ogg", ".webm", ".aac", ".caf"];
@@ -92,11 +100,30 @@ export default function Home() {
     return password ? { "x-access-password": password } : {};
   }
 
+  // Our API routes always respond with JSON, but a platform-level rejection
+  // (Vercel's 413 for an oversized body, a 502/504 from a timeout, etc.)
+  // never reaches our route handler and comes back as plain text or HTML
+  // instead — res.json() would throw an opaque "Unexpected token" parse
+  // error on that. Read as text first and parse manually so we can surface
+  // a readable message either way.
+  async function parseJsonResponse(res: Response): Promise<{ error?: string; [k: string]: unknown }> {
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(
+        res.status === 413
+          ? "That file was too large for the server to accept in one piece. Please try again — it should be auto-chunked."
+          : `Request failed (${res.status}): ${text.slice(0, 200) || res.statusText}`
+      );
+    }
+  }
+
   async function transcribeBlob(blob: Blob, filename: string): Promise<string> {
     const fd = new FormData();
     fd.append("file", blob, filename);
     const res = await fetch("/api/transcribe", { method: "POST", headers: authHeaders(), body: fd });
-    const data = await res.json();
+    const data = await parseJsonResponse(res);
     if (res.status === 401) throw new Error("Access denied — check your password.");
     if (!res.ok) throw new Error(data.error ?? "Transcription failed");
     return data.transcript as string;
@@ -151,7 +178,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ transcript: results[i].transcript }),
       });
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
       if (res.status === 401) throw new Error("Access denied — check your password.");
       if (!res.ok) throw new Error(data.error ?? "Summary failed");
       setResults((prev) =>
