@@ -2,3 +2,7 @@
 node_modules/
 .env.local
 .env
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
