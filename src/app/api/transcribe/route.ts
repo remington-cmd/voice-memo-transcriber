@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { checkAccess } from "@/lib/server/auth";
 
 export const maxDuration = 60;
 
@@ -11,13 +12,8 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const accessPassword = process.env.ACCESS_PASSWORD;
-  if (accessPassword) {
-    const provided = request.headers.get("x-access-password") ?? "";
-    if (provided !== accessPassword) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  const denied = checkAccess(request);
+  if (denied) return denied;
 
   let formData: FormData;
   try {

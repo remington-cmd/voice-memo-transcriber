@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+import { checkAccess } from "@/lib/server/auth";
+import { truncateWords } from "@/lib/text";
 
 export const maxDuration = 30;
 
@@ -8,13 +10,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "OPENAI_API_KEY is not set." }, { status: 500 });
   }
 
-  const accessPassword = process.env.ACCESS_PASSWORD;
-  if (accessPassword) {
-    const provided = request.headers.get("x-access-password") ?? "";
-    if (provided !== accessPassword) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  const denied = checkAccess(request);
+  if (denied) return denied;
 
   let body: { transcript?: string };
   try {
@@ -28,11 +25,7 @@ export async function POST(request: NextRequest) {
   }
 
   // Truncate to ~8 000 words to keep costs low (~$0.001 per summary)
-  const words = body.transcript.split(/\s+/);
-  const text =
-    words.length > 8000
-      ? words.slice(0, 8000).join(" ") + "\n\n[transcript truncated]"
-      : body.transcript;
+  const { text } = truncateWords(body.transcript, 8000);
 
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",

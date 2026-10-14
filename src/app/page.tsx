@@ -3,9 +3,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { chunkAudioFile } from "./audio-chunker";
+import { requestSummary, transcribeBlob } from "@/lib/api-client";
+import { MAX_SIZE, shouldChunk } from "@/lib/limits";
+import { transcribeChunks } from "@/lib/pipeline";
+import { chunkFilename, joinTranscripts, transcriptFilename } from "@/lib/transcript";
 
-const DIRECT_LIMIT = 24 * 1024 * 1024;
-const MAX_SIZE = 500 * 1024 * 1024;
 const LS_KEY = "vmt_results";
 
 interface Result {
@@ -72,20 +74,6 @@ export default function Home() {
     disabled: status === "working",
   });
 
-  function authHeaders(): Record<string, string> {
-    return password ? { "x-access-password": password } : {};
-  }
-
-  async function transcribeBlob(blob: Blob, filename: string): Promise<string> {
-    const fd = new FormData();
-    fd.append("file", blob, filename);
-    const res = await fetch("/api/transcribe", { method: "POST", headers: authHeaders(), body: fd });
-    const data = await res.json();
-    if (res.status === 401) throw new Error("Access denied — check your password.");
-    if (!res.ok) throw new Error(data.error ?? "Transcription failed");
-    return data.transcript as string;
-  }
-
   async function run() {
     if (!file) return;
     sessionStorage.setItem("vmt_pw", password ?? "");
@@ -95,22 +83,18 @@ export default function Home() {
     try {
       let fullTranscript: string;
 
-      if (file.size <= DIRECT_LIMIT) {
+      if (!shouldChunk(file.size)) {
         setProgress("Transcribing…");
-        fullTranscript = await transcribeBlob(file, file.name);
+        fullTranscript = await transcribeBlob(file, file.name, password ?? "");
       } else {
         setProgress("Preparing audio (splitting into chunks)…");
         const chunks = await chunkAudioFile(file);
-        const parts: string[] = [];
-        for (const chunk of chunks) {
-          setProgress(`Transcribing chunk ${chunk.index + 1} of ${chunks.length}…`);
-          const text = await transcribeBlob(
-            chunk.blob,
-            `${file.name}.part${chunk.index + 1}.wav`
-          );
-          parts.push(text.trim());
-        }
-        fullTranscript = parts.join("\n\n");
+        const parts = await transcribeChunks(
+          chunks,
+          (chunk) => transcribeBlob(chunk.blob, chunkFilename(file.name, chunk.index), password ?? ""),
+          setProgress
+        );
+        fullTranscript = joinTranscripts(parts);
       }
 
       setResults((prev) => [
@@ -130,16 +114,9 @@ export default function Home() {
   async function summarize(i: number) {
     setSummarizing(i);
     try {
-      const res = await fetch("/api/summarize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ transcript: results[i].transcript }),
-      });
-      const data = await res.json();
-      if (res.status === 401) throw new Error("Access denied — check your password.");
-      if (!res.ok) throw new Error(data.error ?? "Summary failed");
+      const { summary } = await requestSummary(results[i].transcript, password ?? "");
       setResults((prev) =>
-        prev.map((r, idx) => (idx === i ? { ...r, summary: data.summary as string } : r))
+        prev.map((r, idx) => (idx === i ? { ...r, summary } : r))
       );
     } catch (e) {
       alert(e instanceof Error ? e.message : "Summary failed");
@@ -161,7 +138,7 @@ export default function Home() {
   function download(r: Result) {
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([r.transcript], { type: "text/plain" }));
-    a.download = r.filename.replace(/\.[^.]+$/, "") + "-transcript.txt";
+    a.download = transcriptFilename(r.filename);
     a.click();
   }
 
