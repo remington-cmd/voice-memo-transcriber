@@ -186,13 +186,27 @@ export function linkSignals(...signals: (AbortSignal | undefined)[]): {
   return { signal: controller.signal, dispose };
 }
 
+// Time left for the answer once the upload is done: longer than the route's
+// maxDuration (60 s), so a slow server answers with its own error first.
+const RESPONSE_WAIT_MS = 90_000;
+// The slowest uplink a request is given time for, about 130 kbps.
+const MIN_UPLOAD_BYTES_PER_SECOND = 16 * 1024;
+
+/**
+ * How long to wait for an upload of this many bytes before giving up. The
+ * timer runs while the body is still being sent, so it allows for sending it
+ * on a slow uplink as well as for the server's answer. A fixed 90 s cut off
+ * every 3.9 MB chunk on a link under about 350 kbps, and each retry failed
+ * the same way.
+ */
+export function uploadTimeoutMs(bytes: number): number {
+  return RESPONSE_WAIT_MS + Math.ceil((bytes / MIN_UPLOAD_BYTES_PER_SECOND) * 1000);
+}
+
 export interface TranscribeOptions {
   /** Aborting rejects with an AbortError, which is never retried. */
   signal?: AbortSignal;
-  /**
-   * Gives up on a request with no answer after this long. It is longer than the
-   * route's maxDuration (60 s), so a slow server answers with its own error first.
-   */
+  /** Gives up on a request with no answer after this long. Defaults to uploadTimeoutMs. */
   timeoutMs?: number;
 }
 
@@ -200,7 +214,7 @@ export async function transcribeBlob(
   blob: Blob,
   filename: string,
   password: string,
-  { signal, timeoutMs = 90_000 }: TranscribeOptions = {}
+  { signal, timeoutMs = uploadTimeoutMs(blob.size) }: TranscribeOptions = {}
 ): Promise<string> {
   const fd = new FormData();
   fd.append("file", blob, filename);

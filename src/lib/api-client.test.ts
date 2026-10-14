@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
   apiFetch,
@@ -8,7 +8,9 @@ import {
   readApiResponse,
   requestSummary,
   transcribeBlob,
+  uploadTimeoutMs,
 } from "./api-client";
+import { DIRECT_LIMIT, MAX_CHUNK_SECONDS, wavBytes } from "./limits";
 import { withRetry } from "./retry";
 
 function stubFetch(status: number, body: unknown) {
@@ -306,7 +308,31 @@ describe("apiFetch", () => {
   });
 });
 
+describe("uploadTimeoutMs", () => {
+  // The route's maxDuration: once the body is sent, the server answers within this.
+  const SERVER_MS = 60_000;
+  const sendMs = (bytes: number, bitsPerSecond: number) => (bytes * 8 * 1000) / bitsPerSecond;
+
+  it.each([
+    ["the largest chunk", wavBytes(MAX_CHUNK_SECONDS)],
+    ["the largest direct upload", DIRECT_LIMIT],
+  ])("leaves time to send %s on a slow uplink and still get the answer", (_name, bytes) => {
+    // 300 kbps is a weak cellular uplink; 128 kbps is the slowest one allowed for.
+    expect(uploadTimeoutMs(bytes)).toBeGreaterThan(sendMs(bytes, 300_000) + SERVER_MS + 30_000);
+    expect(uploadTimeoutMs(bytes)).toBeGreaterThan(sendMs(bytes, 128_000) + SERVER_MS);
+  });
+
+  it("stays at 90 s for a tiny body", () => {
+    expect(uploadTimeoutMs(0)).toBe(90_000);
+    expect(uploadTimeoutMs(1)).toBe(90_001);
+  });
+});
+
 describe("transcribeBlob", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("posts the blob and returns the transcript on 200", async () => {
     const fetchMock = stubFetch(200, { transcript: "hello world" });
 
@@ -379,6 +405,23 @@ describe("transcribeBlob", () => {
     const err = await caught(transcribeBlob(new Blob(["x"]), "memo.m4a", "", { timeoutMs: 20 }));
     expect(err).toMatchObject({ status: 0, code: "timeout", retryable: true });
     expect(err.message).toBe("Request timed out.");
+  });
+
+  it("by default gives a large chunk time to upload on a slow link before timing out", async () => {
+    vi.useFakeTimers();
+    stubHangingFetch();
+    const blob = new Blob([new Uint8Array(wavBytes(MAX_CHUNK_SECONDS))]);
+    let settled = false;
+    const pending = caught(transcribeBlob(blob, "memo.m4a.part1.wav", "")).finally(() => {
+      settled = true;
+    });
+
+    // Sending 3.9 MB at 300 kbps takes about 103 s, then the server has up to 60 s.
+    await vi.advanceTimersByTimeAsync(103_000 + 60_000);
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(uploadTimeoutMs(blob.size));
+    expect(await pending).toMatchObject({ code: "timeout", retryable: true });
   });
 
   it("rejects with an AbortError, not a retryable error, when the caller aborts", async () => {
