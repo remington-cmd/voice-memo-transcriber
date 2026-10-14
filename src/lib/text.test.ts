@@ -29,4 +29,28 @@ describe("truncateWords", () => {
     const input = words(8000);
     expect(truncateWords(input, 8000).text).toBe(input);
   });
+
+  it("does not count leading or trailing whitespace as words", () => {
+    expect(truncateWords("  a b", 8000)).toMatchObject({ wordsUsed: 2, totalWords: 2 });
+    expect(truncateWords("a b \n", 8000)).toMatchObject({ wordsUsed: 2, totalWords: 2 });
+    expect(truncateWords("", 8000)).toMatchObject({ wordsUsed: 0, totalWords: 0 });
+    expect(truncateWords(" \n\t ", 8000)).toMatchObject({ wordsUsed: 0, totalWords: 0 });
+  });
+
+  it("does not truncate a padded transcript that is exactly at the cap", () => {
+    const input = "\n  " + words(8000) + "  \n";
+    expect(truncateWords(input, 8000)).toEqual({
+      text: input,
+      truncated: false,
+      wordsUsed: 8000,
+      totalWords: 8000,
+    });
+  });
+
+  it("starts the truncated text at the first real word", () => {
+    const result = truncateWords("   " + words(9000), 8000);
+
+    expect(result.totalWords).toBe(9000);
+    expect(result.text).toBe(words(8000) + "\n\n[transcript truncated]");
+  });
 });

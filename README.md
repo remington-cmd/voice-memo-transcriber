@@ -1,6 +1,6 @@
 # Voice Memo Transcriber
 
-A small personal Next.js app. Drop an audio file to get a transcript from OpenAI Whisper, and optionally a short summary from gpt-4o-mini. Transcripts are kept in your browser's localStorage; the server stores nothing.
+A small personal Next.js app. Drop an audio file to get a transcript from OpenAI (whisper-1 by default), and optionally a short summary (gpt-4o-mini by default). Transcripts are kept in your browser's localStorage; the server stores nothing.
 
 ## Setup
 
@@ -20,7 +20,25 @@ Checks: `npm test`, `npm run typecheck`, `npm run build`.
 | --- | --- | --- |
 | `OPENAI_API_KEY` | Yes | Server-side key for transcription and summaries. Never sent to the browser. |
 | `ACCESS_PASSWORD` | Strongly recommended | Password both API routes require. Type it into the page's password field. Without it, anyone with the URL can spend your OpenAI credit, and a production server logs a warning. Use at least 20 random characters (`openssl rand -base64 24`). Surrounding whitespace is ignored; a whitespace-only value is treated as a misconfiguration (HTTP 503). |
+| `OPENAI_TRANSCRIBE_MODEL` | No | Transcription model. Defaults to `whisper-1`. See [Models](#models). |
+| `OPENAI_SUMMARY_MODEL` | No | Summary model. Defaults to `gpt-4o-mini`. See [Models](#models). |
 | `ALLOW_PUBLIC` | No | Only read when fail-closed mode is on (`FAIL_CLOSED_IN_PRODUCTION` in `src/lib/server/auth.ts`, off by default). In that mode a production server without `ACCESS_PASSWORD` answers 503 unless `ALLOW_PUBLIC=1`. |
+
+## Models
+
+Both default models are on OpenAI's [deprecation schedule](https://developers.openai.com/api/docs/deprecations) (checked 2026-10-14). After a shutdown date every request that uses the model fails, and the app shows "OpenAI model not available".
+
+| Variable | Default | Shutdown | OpenAI's replacement |
+| --- | --- | --- | --- |
+| `OPENAI_TRANSCRIBE_MODEL` | `whisper-1` | 2027-02-26 | `gpt-transcribe` (or `gpt-live-transcribe`) |
+| `OPENAI_SUMMARY_MODEL` | `gpt-4o-mini` (snapshot `gpt-4o-mini-2024-07-18`) | 2027-01-14 | `gpt-6-luna` |
+
+Test a replacement before switching:
+
+1. Set the variable in `.env.local` and run `npm run dev`.
+2. For transcription, try an iPhone `.m4a` that goes up directly and a recording long enough to be split into 16 kHz WAV chunks. A replacement can accept different formats or have lower size or duration limits.
+3. For summaries, summarize one long real transcript and check that it is complete. The route caps output with `max_completion_tokens: 1000`; reasoning models spend part of that budget on reasoning, so a summary marked `[summary cut off]` means the cap is too low for that model.
+4. Set the variable in Vercel for Production and Preview, and redeploy.
 
 ## Deploying to Vercel
 
@@ -28,4 +46,5 @@ Checks: `npm test`, `npm run typecheck`, `npm run build`.
 - **Set `ACCESS_PASSWORD`** for both Production and Preview under Project → Settings → Environment Variables, then redeploy.
 - **Set a monthly budget** on the OpenAI project that owns the key, so a leaked URL or password has a bounded cost.
 - **Rate limiting (optional).** The app has no built-in rate limit. If your Vercel plan includes Firewall rate limiting, add a rule on `/api/*`, for example 30 requests per minute per IP.
+- **Time limits.** The transcribe function may run for 60 s and summarize for 30 s (`maxDuration`). Each gives up on OpenAI 5 s before that and returns a "took too long" error instead of the platform's plain-text timeout.
 - The page asks search engines not to index it. That does not hide the URL from anyone who already has it.

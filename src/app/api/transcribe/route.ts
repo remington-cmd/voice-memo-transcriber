@@ -1,7 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { checkAccess } from "@/lib/server/auth";
+import { badResponse, callOpenAI, errorResponse } from "@/lib/server/openai";
 
 export const maxDuration = 60;
+
+// Stop waiting 5 s before the platform kills the function, so the client still gets JSON.
+const UPSTREAM_TIMEOUT_MS = (maxDuration - 5) * 1000;
+
+// OpenAI's per-file limit for transcription uploads.
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
 export async function POST(request: NextRequest) {
   // Auth first, so anonymous callers cannot probe the server configuration.
@@ -23,35 +30,36 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   }
 
-  const file = formData.get("file") as File | null;
-  if (!file) {
-    return NextResponse.json({ error: "No file provided" }, { status: 400 });
+  const file = formData.get("file");
+  if (!(file instanceof File) || file.size === 0) {
+    return errorResponse(400, "no_file", "No file provided");
+  }
+  if (file.size > MAX_FILE_BYTES) {
+    return errorResponse(413, "too_large", "File exceeds the 25 MB transcription limit.");
   }
 
+  const model = process.env.OPENAI_TRANSCRIBE_MODEL?.trim() || "whisper-1";
+
+  // No response_format: the default json carries `text`, which is all we use.
   const whisperForm = new FormData();
   whisperForm.append("file", file);
-  whisperForm.append("model", "whisper-1");
-  whisperForm.append("response_format", "verbose_json");
+  whisperForm.append("model", model);
 
-  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: whisperForm,
-  });
+  const result = await callOpenAI(
+    "https://api.openai.com/v1/audio/transcriptions",
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: whisperForm,
+    },
+    { timeoutMs: UPSTREAM_TIMEOUT_MS, kind: "transcribe" }
+  );
+  if (!result.ok) return result.response;
 
-  if (!response.ok) {
-    const err = await response.text();
-    console.error("Whisper error:", err);
-    return NextResponse.json(
-      { error: "Transcription failed. Check your API key." },
-      { status: response.status }
-    );
+  const text = (result.data as { text?: unknown } | null)?.text;
+  if (typeof text !== "string") {
+    console.error("OpenAI transcribe response has no text field");
+    return badResponse();
   }
-
-  const result = await response.json();
-  return NextResponse.json({
-    transcript: result.text as string,
-    duration: result.duration as number | undefined,
-    language: result.language as string | undefined,
-  });
+  return NextResponse.json({ transcript: text });
 }
