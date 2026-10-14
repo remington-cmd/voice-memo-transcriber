@@ -6,6 +6,7 @@ import { truncateWords } from "@/lib/text";
 export const maxDuration = 30;
 
 // Stop waiting 5 s before the platform kills the function, so the client still gets JSON.
+// It counts from the start of the handler, since reading the body uses up time too.
 const UPSTREAM_TIMEOUT_MS = (maxDuration - 5) * 1000;
 
 // About 55 minutes of speech, at roughly $0.001 per summary. Raising it is cheap, but time a
@@ -21,20 +22,22 @@ interface ChatCompletion {
 }
 
 export async function POST(request: NextRequest) {
+  const deadline = Date.now() + UPSTREAM_TIMEOUT_MS;
+
   // Auth first, so anonymous callers cannot probe the server configuration.
   const denied = checkAccess(request);
   if (denied) return denied;
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return NextResponse.json({ error: "OPENAI_API_KEY is not set." }, { status: 500 });
+    return errorResponse(500, "missing_api_key", "OPENAI_API_KEY is not set.");
   }
 
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+    return errorResponse(400, "invalid_request", "Invalid request");
   }
 
   const transcript =
@@ -63,7 +66,7 @@ export async function POST(request: NextRequest) {
         max_completion_tokens: 1000,
       }),
     },
-    { timeoutMs: UPSTREAM_TIMEOUT_MS, kind: "summarize" }
+    { timeoutMs: Math.max(1000, deadline - Date.now()), kind: "summarize" }
   );
   if (!result.ok) return result.response;
 

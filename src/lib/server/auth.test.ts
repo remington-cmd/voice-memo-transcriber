@@ -76,6 +76,8 @@ describe("checkAccess without a password", () => {
     const body = await res!.json();
     expect(body.code).toBe("misconfigured");
     expect(body.error).toContain("ALLOW_PUBLIC=1");
+    // A configuration error never passes on its own, so the client must not retry it.
+    expect(body.retryable).toBe(false);
   });
 
   it("allows production without a password when ALLOW_PUBLIC=1", () => {
@@ -102,6 +104,7 @@ describe("checkAccess with a password", () => {
     expect(await checkAccess(withPassword("nope"), env)!.json()).toEqual({
       code: "bad_password",
       error: "Unauthorized",
+      retryable: false,
     });
   });
 

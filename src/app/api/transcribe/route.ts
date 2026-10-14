@@ -5,21 +5,25 @@ import { badResponse, callOpenAI, errorResponse } from "@/lib/server/openai";
 export const maxDuration = 60;
 
 // Stop waiting 5 s before the platform kills the function, so the client still gets JSON.
+// It counts from the start of the handler, since reading the body uses up time too.
 const UPSTREAM_TIMEOUT_MS = (maxDuration - 5) * 1000;
 
 // OpenAI's per-file limit for transcription uploads.
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
 export async function POST(request: NextRequest) {
+  const deadline = Date.now() + UPSTREAM_TIMEOUT_MS;
+
   // Auth first, so anonymous callers cannot probe the server configuration.
   const denied = checkAccess(request);
   if (denied) return denied;
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return NextResponse.json(
-      { error: "OPENAI_API_KEY is not set. Add it to your environment variables." },
-      { status: 500 }
+    return errorResponse(
+      500,
+      "missing_api_key",
+      "OPENAI_API_KEY is not set. Add it to your environment variables."
     );
   }
 
@@ -27,7 +31,7 @@ export async function POST(request: NextRequest) {
   try {
     formData = await request.formData();
   } catch {
-    return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+    return errorResponse(400, "invalid_request", "Invalid request");
   }
 
   const file = formData.get("file");
@@ -52,7 +56,7 @@ export async function POST(request: NextRequest) {
       headers: { Authorization: `Bearer ${apiKey}` },
       body: whisperForm,
     },
-    { timeoutMs: UPSTREAM_TIMEOUT_MS, kind: "transcribe" }
+    { timeoutMs: Math.max(1000, deadline - Date.now()), kind: "transcribe" }
   );
   if (!result.ok) return result.response;
 

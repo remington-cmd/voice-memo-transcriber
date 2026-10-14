@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { POST } from "./route";
 
 function request(body: unknown, headers: Record<string, string> = {}): NextRequest {
@@ -33,6 +33,44 @@ describe("POST /api/summarize", () => {
     vi.stubEnv("OPENAI_API_KEY", "sk-test");
     vi.stubEnv("ACCESS_PASSWORD", "");
     vi.stubEnv("OPENAI_SUMMARY_MODEL", "");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("returns a non-retryable 500 when OPENAI_API_KEY is missing", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "");
+    const fetchMock = stubUpstream();
+
+    const res = await POST(request({ transcript: "hello" }));
+
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({
+      code: "missing_api_key",
+      error: "OPENAI_API_KEY is not set.",
+      retryable: false,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("counts the upstream timeout from the start of the request", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    stubUpstream();
+    const req = request({ transcript: "hello" });
+    const readJson = req.json.bind(req);
+    // A body that takes 10 s to arrive.
+    req.json = async () => {
+      vi.advanceTimersByTime(10_000);
+      return readJson();
+    };
+
+    const res = await POST(req);
+
+    expect(res.status).toBe(200);
+    expect(timeout).toHaveBeenCalledTimes(1);
+    expect(timeout.mock.calls[0][0]).toBe(25_000 - 10_000);
   });
 
   it("returns 400 when the transcript is missing", async () => {

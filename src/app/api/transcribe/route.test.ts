@@ -1,5 +1,7 @@
 import { NextRequest } from "next/server";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readApiResponse } from "@/lib/api-client";
+import { withRetry } from "@/lib/retry";
 import { POST } from "./route";
 
 function formRequest(form: FormData, headers: Record<string, string> = {}): NextRequest {
@@ -16,6 +18,8 @@ function request(headers: Record<string, string> = {}): NextRequest {
   return formRequest(form, headers);
 }
 
+const anyBody = (data: unknown): data is unknown => true;
+
 function stubUpstream(respond: () => Response = () => Response.json({ text: "hello world" })) {
   const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => respond());
   vi.stubGlobal("fetch", fetchMock);
@@ -29,6 +33,10 @@ describe("POST /api/transcribe", () => {
     vi.stubEnv("OPENAI_TRANSCRIBE_MODEL", "");
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("returns 500 when OPENAI_API_KEY is missing", async () => {
     vi.stubEnv("OPENAI_API_KEY", "");
     const fetchMock = stubUpstream();
@@ -36,7 +44,29 @@ describe("POST /api/transcribe", () => {
     const res = await POST(request());
 
     expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({
+      code: "missing_api_key",
+      error: "OPENAI_API_KEY is not set. Add it to your environment variables.",
+      retryable: false,
+    });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a missing OPENAI_API_KEY", { OPENAI_API_KEY: "" }, 500, "missing_api_key"],
+    ["a whitespace-only ACCESS_PASSWORD", { ACCESS_PASSWORD: "  " }, 503, "misconfigured"],
+  ])("tells the client not to retry %s", async (_name, env, status, code) => {
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+    stubUpstream();
+    // The client's own retry loop, fed the route's real responses.
+    const call = vi.fn(async () => readApiResponse(await POST(request()), anyBody));
+
+    const err = await withRetry(call, { attempts: 4, sleep: async () => {} }).catch(
+      (e: unknown) => e
+    );
+
+    expect(err).toMatchObject({ status, code, retryable: false });
+    expect(call).toHaveBeenCalledTimes(1);
   });
 
   it("returns 401 for a wrong password without calling OpenAI", async () => {
@@ -46,7 +76,11 @@ describe("POST /api/transcribe", () => {
     const res = await POST(request({ "x-access-password": "wrong" }));
 
     expect(res.status).toBe(401);
-    expect(await res.json()).toEqual({ code: "bad_password", error: "Unauthorized" });
+    expect(await res.json()).toEqual({
+      code: "bad_password",
+      error: "Unauthorized",
+      retryable: false,
+    });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -180,6 +214,25 @@ describe("POST /api/transcribe", () => {
 
     expect(res.status).toBe(502);
     expect(await res.json()).toMatchObject({ code: "upstream_bad_response" });
+  });
+
+  it("counts the upstream timeout from when the request arrives, not from the upload", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    stubUpstream();
+    const req = request();
+    const readForm = req.formData.bind(req);
+    // A body that takes 20 s to arrive.
+    req.formData = async () => {
+      vi.advanceTimersByTime(20_000);
+      return readForm();
+    };
+
+    const res = await POST(req);
+
+    expect(res.status).toBe(200);
+    expect(timeout).toHaveBeenCalledTimes(1);
+    expect(timeout.mock.calls[0][0]).toBe(55_000 - 20_000);
   });
 
   it("returns JSON when OpenAI cannot be reached", async () => {

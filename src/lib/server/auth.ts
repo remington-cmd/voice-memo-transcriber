@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { NextResponse } from "next/server";
+import type { NextResponse } from "next/server";
+import { errorResponse } from "./openai";
 
 /**
  * When true, a production server with no ACCESS_PASSWORD refuses API calls
@@ -29,8 +30,9 @@ function sha256(value: string): Buffer {
   return createHash("sha256").update(value, "utf8").digest();
 }
 
+// Not retryable: no retry fixes a deploy's configuration.
 function misconfigured(error: string): NextResponse {
-  return NextResponse.json({ code: "misconfigured", error }, { status: 503 });
+  return errorResponse(503, "misconfigured", error);
 }
 
 /**
@@ -88,7 +90,7 @@ export function checkAccess(
   }
 
   if (!timingSafeEqual(sha256(provided.trim()), sha256(expected))) {
-    return NextResponse.json({ code: "bad_password", error: "Unauthorized" }, { status: 401 });
+    return errorResponse(401, "bad_password", "Unauthorized");
   }
   return null;
 }
