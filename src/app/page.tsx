@@ -2,11 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
-import { chunkAudioFile } from "./audio-chunker";
+import { chunkAudioFile, type AudioChunk } from "./audio-chunker";
 import { requestSummary, transcribeBlob } from "@/lib/api-client";
 import { MAX_SIZE, shouldChunk } from "@/lib/limits";
-import { transcribeChunks } from "@/lib/pipeline";
+import { ChunkError, partialTranscript, transcribeChunks } from "@/lib/pipeline";
 import { applySummary, createResult, loadResults, removeResult, type Result } from "@/lib/results";
+import { withRetry } from "@/lib/retry";
 import { safeGet, safeSet } from "@/lib/storage";
 import { chunkFilename, joinTranscripts, transcriptFilename } from "@/lib/transcript";
 
@@ -15,6 +16,30 @@ const PW_KEY = "vmt_pw";
 
 const SAVE_ERROR =
   "Browser storage is full or blocked: the newest transcript is shown but NOT saved. Download it (↓ .txt), then delete old transcripts.";
+
+// Calls per upload. A 504 on a long direct file tends to repeat, so that gets
+// one retry; a 2-minute chunk gets three.
+const DIRECT_ATTEMPTS = 2;
+const CHUNK_ATTEMPTS = 4;
+
+/**
+ * Work kept between runs on the same file, so Resume continues at the chunk
+ * that failed without decoding again or paying for finished chunks twice.
+ */
+interface Job {
+  /** Which file this belongs to: name, size and lastModified. */
+  key: string;
+  /** Decoded chunks, kept after a failure until success or another file. */
+  chunks?: AudioChunk[];
+  /** Transcript of each finished chunk, by index. */
+  parts: (string | undefined)[];
+  /** Id of the partial result saved for this job, replaced on each stop. */
+  partialId?: string;
+}
+
+function fileKey(file: File): string {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
 
 export default function Home() {
   // false until storage has been read on mount (avoids a hydration mismatch)
@@ -32,6 +57,12 @@ export default function Home() {
   // Ids of the transcripts with a summary request in flight
   const [summarizing, setSummarizing] = useState<ReadonlySet<string>>(() => new Set());
   const transcriptsHeading = useRef<HTMLHeadingElement>(null);
+  const job = useRef<Job | null>(null);
+  // Where Resume would continue, shown on the button. Null when there is nothing to resume.
+  const [resume, setResume] = useState<{ chunk: number; total: number } | null>(null);
+  // Aborts the running job; null when no job is running.
+  const jobAbort = useRef<AbortController | null>(null);
+  const wakeLock = useRef<WakeLockSentinel | null>(null);
 
   // Load password from sessionStorage and transcripts from localStorage on mount.
   // Storage may be blocked or hold anything, so none of this can throw.
@@ -68,13 +99,65 @@ export default function Home() {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
+  // While a job runs, warn before the page is closed or reloaded, and get the
+  // screen wake lock back when the page is shown again (hiding it releases the lock).
+  useEffect(() => {
+    if (status !== "working") return;
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+    function onVisibilityChange() {
+      if (document.visibilityState === "visible") acquireWakeLock();
+    }
+    window.addEventListener("beforeunload", onBeforeUnload);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [status]);
+
+  // Best effort: keep a phone's screen on while a job runs, since a locked iPhone
+  // suspends the page mid-upload. Unsupported or refused requests are ignored.
+  function acquireWakeLock() {
+    if (wakeLock.current && !wakeLock.current.released) return;
+    try {
+      navigator.wakeLock?.request("screen").then(
+        (lock) => {
+          // The job may have ended while the request was pending.
+          if (!jobAbort.current) {
+            lock.release().catch(() => {});
+            return;
+          }
+          wakeLock.current?.release().catch(() => {});
+          wakeLock.current = lock;
+        },
+        () => {}
+      );
+    } catch {}
+  }
+
+  function releaseWakeLock() {
+    wakeLock.current?.release().catch(() => {});
+    wakeLock.current = null;
+  }
+
+  function forgetJob() {
+    job.current = null;
+    setResume(null);
+  }
+
   const onDrop = useCallback((accepted: File[], rejected: { file: File }[]) => {
     if (rejected.length > 0) {
       setError("File too large (max 500 MB) or unsupported type. Use .m4a, .mp3, .wav, .mp4, .ogg.");
       return;
     }
     setError(null);
-    setFile(accepted[0] ?? null);
+    const next = accepted[0] ?? null;
+    // Dropping the same file again keeps its finished chunks for Resume.
+    if (!next || job.current?.key !== fileKey(next)) forgetJob();
+    setFile(next);
     setStatus("idle");
   }, []);
 
@@ -96,34 +179,101 @@ export default function Home() {
 
   async function run() {
     if (!file) return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    jobAbort.current = controller;
+    // Before the first await, while the click still counts as a user gesture.
+    acquireWakeLock();
+
+    const key = fileKey(file);
+    if (job.current?.key !== key) job.current = { key, parts: [] };
+    const current = job.current;
+
     setStatus("working");
     setError(null);
+    setResume(null);
 
     try {
       let fullTranscript: string;
 
       if (!shouldChunk(file.size)) {
         setProgress("Transcribing…");
-        fullTranscript = await transcribeBlob(file, file.name, password);
-      } else {
-        setProgress("Preparing audio (splitting into chunks)…");
-        const chunks = await chunkAudioFile(file);
-        const parts = await transcribeChunks(
-          chunks,
-          (chunk) => transcribeBlob(chunk.blob, chunkFilename(file.name, chunk.index), password),
-          setProgress
+        fullTranscript = await withRetry(
+          () => transcribeBlob(file, file.name, password, { signal }),
+          {
+            attempts: DIRECT_ATTEMPTS,
+            signal,
+            onRetry: ({ attempt, attempts }) =>
+              setProgress(`Transcribing… retrying (attempt ${attempt} of ${attempts})`),
+          }
         );
+      } else {
+        if (!current.chunks) {
+          setProgress("Preparing audio (splitting into chunks)…");
+          current.chunks = await chunkAudioFile(file);
+        }
+        const chunks = current.chunks;
+        const parts = await transcribeChunks({
+          chunks,
+          parts: current.parts,
+          signal,
+          onProgress: setProgress,
+          upload: (chunk) =>
+            withRetry(
+              () =>
+                transcribeBlob(chunk.blob, chunkFilename(file.name, chunk.index), password, {
+                  signal,
+                }),
+              {
+                attempts: CHUNK_ATTEMPTS,
+                signal,
+                onRetry: ({ attempt, attempts }) =>
+                  setProgress(
+                    `Transcribing chunk ${chunk.index + 1} of ${chunks.length}… retrying (attempt ${attempt} of ${attempts})`
+                  ),
+              }
+            ),
+        });
         fullTranscript = joinTranscripts(parts);
       }
 
-      setResults((prev) => [createResult(file.name, fullTranscript), ...prev]);
+      const { partialId } = current;
+      forgetJob();
       setFile(null);
       setStatus("idle");
       setProgress("");
+      if (!fullTranscript.trim()) {
+        setError("No speech detected. Nothing was saved.");
+        return;
+      }
+      setError(null);
+      // The full transcript replaces the partial one saved by an earlier stop.
+      setResults((prev) => [
+        createResult(file.name, fullTranscript),
+        ...(partialId ? removeResult(prev, partialId) : prev),
+      ]);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong.");
+      if (e instanceof ChunkError) {
+        // Save what is done as one partial result per file, replacing the last one.
+        const text = partialTranscript(current.parts, e);
+        if (text) {
+          const partial: Result = { ...createResult(file.name, text), partial: true };
+          const previousId = current.partialId;
+          current.partialId = partial.id;
+          setResults((prev) => [partial, ...(previousId ? removeResult(prev, previousId) : prev)]);
+        }
+        setError(`${e.message} Click Resume to continue from chunk ${e.index + 1}.`);
+        setResume({ chunk: e.index + 1, total: e.total });
+      } else if (signal.aborted) {
+        setError("Cancelled. Nothing was saved.");
+      } else {
+        setError(e instanceof Error ? e.message : "Something went wrong.");
+      }
       setStatus("error");
       setProgress("");
+    } finally {
+      jobAbort.current = null;
+      releaseWakeLock();
     }
   }
 
@@ -277,16 +427,27 @@ export default function Home() {
             </p>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            {status !== "working" && (
+            {status === "working" ? (
+              <button onClick={() => jobAbort.current?.abort()} style={btn("outline")}>
+                Cancel
+              </button>
+            ) : (
               <button
-                onClick={() => setFile(null)}
+                onClick={() => {
+                  setFile(null);
+                  forgetJob();
+                }}
                 style={{ background: "none", border: "none", color: "#666", cursor: "pointer", fontSize: 18, lineHeight: 1 }}
               >
                 ×
               </button>
             )}
             <button onClick={run} disabled={status === "working"} style={btn("primary")}>
-              {status === "working" ? "Working…" : "Transcribe"}
+              {status === "working"
+                ? "Working…"
+                : resume
+                  ? `Resume (chunk ${resume.chunk} of ${resume.total})`
+                  : "Transcribe"}
             </button>
           </div>
         </div>
@@ -354,6 +515,7 @@ export default function Home() {
                   <p style={{ margin: 0, fontWeight: 500, fontSize: 14 }}>{r.filename}</p>
                   <p style={{ margin: 0, color: "#666", fontSize: 12, marginTop: 2 }}>
                     {new Date(r.at).toLocaleString()}
+                    {r.partial && " · Partial"}
                   </p>
                 </div>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
@@ -367,7 +529,7 @@ export default function Home() {
                   <button onClick={() => download(r)} style={btn("outline")}>↓ .txt</button>
                   <button
                     onClick={() => summarize(r.id)}
-                    disabled={summarizing.has(r.id)}
+                    disabled={summarizing.has(r.id) || !r.transcript.trim()}
                     style={btn("outline")}
                   >
                     {summarizing.has(r.id) ? "Summarizing…" : r.summary ? "Re-summarize" : "✦ Summarize"}

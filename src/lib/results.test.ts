@@ -89,6 +89,16 @@ describe("loadResults", () => {
     ]);
   });
 
+  it("keeps the partial flag only when it is a boolean", () => {
+    const raw = JSON.stringify([
+      { id: "a", filename: "a.m4a", transcript: "t", at: AT, partial: true },
+      { id: "b", filename: "b.m4a", transcript: "t", at: AT, partial: false },
+      { id: "c", filename: "c.m4a", transcript: "t", at: AT, partial: "yes" },
+    ]);
+    expect(loadResults(raw).results.map((r) => r.partial)).toEqual([true, false, undefined]);
+    expect(loadResults(raw).results[2]).not.toHaveProperty("partial");
+  });
+
   it("backfills missing ids uniquely and preserves existing ones", () => {
     // Saved before ids existed: no id at all.
     const legacy = { filename: "old.m4a", transcript: "t", at: AT };
@@ -112,6 +122,7 @@ describe("loadResults", () => {
       result("a", { summary: "s", summaryCoverage: { wordsUsed: 8000, totalWords: 27000 } }),
       result("b", { summary: "s [summary cut off]", summaryIncomplete: true }),
       result("c"),
+      result("d", { partial: true }),
     ];
     const raw = JSON.stringify(list);
     const loaded = loadResults(raw);

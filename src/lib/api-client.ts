@@ -158,20 +158,76 @@ function hasSummary(data: unknown): data is Record<string, unknown> & { summary:
   return isRecord(data) && typeof data.summary === "string";
 }
 
+/**
+ * One signal that aborts when any of `signals` does. AbortSignal.any needs
+ * Safari 17.4, so this links them by hand. Call dispose() when done, so a
+ * long-lived signal does not keep a listener for every request.
+ */
+export function linkSignals(...signals: (AbortSignal | undefined)[]): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  const cleanups: (() => void)[] = [];
+  const dispose = () => cleanups.splice(0).forEach((cleanup) => cleanup());
+  const abort = () => {
+    controller.abort();
+    dispose();
+  };
+  for (const signal of signals) {
+    if (!signal) continue;
+    if (signal.aborted) {
+      abort();
+      break;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    cleanups.push(() => signal.removeEventListener("abort", abort));
+  }
+  return { signal: controller.signal, dispose };
+}
+
+export interface TranscribeOptions {
+  /** Aborting rejects with an AbortError, which is never retried. */
+  signal?: AbortSignal;
+  /**
+   * Gives up on a request with no answer after this long. It is longer than the
+   * route's maxDuration (60 s), so a slow server answers with its own error first.
+   */
+  timeoutMs?: number;
+}
+
 export async function transcribeBlob(
   blob: Blob,
   filename: string,
-  password: string
+  password: string,
+  { signal, timeoutMs = 90_000 }: TranscribeOptions = {}
 ): Promise<string> {
   const fd = new FormData();
   fd.append("file", blob, filename);
-  const res = await apiFetch("/api/transcribe", {
-    method: "POST",
-    headers: authHeaders(password),
-    body: fd,
-  });
-  const { transcript } = await readApiResponse(res, hasTranscript);
-  return transcript;
+
+  // AbortSignal.timeout needs Safari 16, so the timeout is a plain timer.
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(), timeoutMs);
+  const linked = linkSignals(signal, timeout.signal);
+  try {
+    const res = await apiFetch("/api/transcribe", {
+      method: "POST",
+      headers: authHeaders(password),
+      body: fd,
+      signal: linked.signal,
+    });
+    const { transcript } = await readApiResponse(res, hasTranscript);
+    return transcript;
+  } catch (err) {
+    // A caller's abort stays an AbortError; only our own timer becomes a timeout.
+    if (!signal?.aborted && timeout.signal.aborted) {
+      throw new ApiError("Request timed out.", { status: 0, code: "timeout", retryable: true });
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    linked.dispose();
+  }
 }
 
 export async function requestSummary(

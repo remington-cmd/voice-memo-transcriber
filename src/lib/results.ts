@@ -20,6 +20,8 @@ export interface Result {
   summaryCoverage?: SummaryCoverage;
   /** Set when the model hit its output cap, so the summary is cut off. */
   summaryIncomplete?: boolean;
+  /** Set on the text saved from a chunked job that stopped before the last chunk. */
+  partial?: boolean;
 }
 
 export interface LoadedResults {
@@ -49,7 +51,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** The entry as a Result with only the known fields, or null when a required one is missing. */
 function toResult(entry: unknown): Result | null {
   if (!isRecord(entry)) return null;
-  const { id, filename, transcript, at, summary, summaryCoverage, summaryIncomplete } = entry;
+  const { id, filename, transcript, at, summary, summaryCoverage, summaryIncomplete, partial } =
+    entry;
   if (typeof filename !== "string" || typeof transcript !== "string" || typeof at !== "string") {
     return null;
   }
@@ -68,6 +71,7 @@ function toResult(entry: unknown): Result | null {
     };
   }
   if (typeof summaryIncomplete === "boolean") result.summaryIncomplete = summaryIncomplete;
+  if (typeof partial === "boolean") result.partial = partial;
   return result;
 }
 

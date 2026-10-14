@@ -3,11 +3,13 @@ import {
   ApiError,
   apiFetch,
   authHeaders,
+  linkSignals,
   parseRetryAfter,
   readApiResponse,
   requestSummary,
   transcribeBlob,
 } from "./api-client";
+import { withRetry } from "./retry";
 
 function stubFetch(status: number, body: unknown) {
   const fetchMock = vi.fn(async (_url: string, _init: RequestInit) =>
@@ -19,6 +21,21 @@ function stubFetch(status: number, body: unknown) {
 
 function stubFetchResponse(res: Response) {
   vi.stubGlobal("fetch", vi.fn(async () => res));
+}
+
+/** A fetch that never answers, but rejects when its signal aborts, as the real one does. */
+function stubHangingFetch() {
+  const fetchMock = vi.fn(
+    (_url: string, init: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal!;
+        signal.addEventListener("abort", () =>
+          reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"))
+        );
+      })
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
 }
 
 function headersOf(fetchMock: ReturnType<typeof stubFetch>): Record<string, string> {
@@ -354,6 +371,69 @@ describe("transcribeBlob", () => {
     const fetchMock = stubFetch(200, { transcript: "ok" });
     await transcribeBlob(new Blob(["x"]), "memo.m4a", "");
     expect(headersOf(fetchMock)).not.toHaveProperty("x-access-password");
+  });
+
+  it("times out a request that never answers with a retryable ApiError", async () => {
+    stubHangingFetch();
+
+    const err = await caught(transcribeBlob(new Blob(["x"]), "memo.m4a", "", { timeoutMs: 20 }));
+    expect(err).toMatchObject({ status: 0, code: "timeout", retryable: true });
+    expect(err.message).toBe("Request timed out.");
+  });
+
+  it("rejects with an AbortError, not a retryable error, when the caller aborts", async () => {
+    const fetchMock = stubHangingFetch();
+    const controller = new AbortController();
+    const signal = controller.signal;
+
+    const pending = withRetry(
+      () => transcribeBlob(new Blob(["x"]), "memo.m4a", "", { signal, timeoutMs: 60_000 }),
+      { attempts: 4, signal, sleep: async () => {} }
+    ).catch((e: unknown) => e);
+    controller.abort();
+    const err = await pending;
+
+    expect(err).not.toBeInstanceOf(ApiError);
+    expect((err as DOMException).name).toBe("AbortError");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts the request it sent when the caller aborts", async () => {
+    const fetchMock = stubHangingFetch();
+    const controller = new AbortController();
+
+    const pending = transcribeBlob(new Blob(["x"]), "memo.m4a", "", {
+      signal: controller.signal,
+    }).catch(() => {});
+    controller.abort();
+    await pending;
+
+    expect(fetchMock.mock.calls[0][1].signal?.aborted).toBe(true);
+  });
+});
+
+describe("linkSignals", () => {
+  it("aborts when any of its signals aborts", () => {
+    const a = new AbortController();
+    const b = new AbortController();
+    const linked = linkSignals(a.signal, undefined, b.signal);
+    expect(linked.signal.aborted).toBe(false);
+    b.abort();
+    expect(linked.signal.aborted).toBe(true);
+  });
+
+  it("starts aborted when a signal already is", () => {
+    const a = new AbortController();
+    a.abort();
+    expect(linkSignals(new AbortController().signal, a.signal).signal.aborted).toBe(true);
+  });
+
+  it("stops listening once disposed", () => {
+    const a = new AbortController();
+    const linked = linkSignals(a.signal);
+    linked.dispose();
+    a.abort();
+    expect(linked.signal.aborted).toBe(false);
   });
 });
 
