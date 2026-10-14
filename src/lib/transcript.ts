@@ -1,8 +1,15 @@
 // Naming and joining helpers for transcripts.
 
-/** Join per-chunk transcripts into one, trimming each and separating with a blank line. */
+/**
+ * Join per-chunk transcripts into one. Each part is trimmed and empty parts are
+ * dropped. Chunk cuts are not sentence breaks, so parts are joined with a single
+ * space rather than a paragraph break.
+ */
 export function joinTranscripts(parts: string[]): string {
-  return parts.map((part) => part.trim()).join("\n\n");
+  return parts
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join(" ");
 }
 
 /** "memo.m4a" -> "memo-transcript.txt" */

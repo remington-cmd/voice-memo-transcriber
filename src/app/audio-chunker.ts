@@ -1,8 +1,10 @@
 // Browser-side audio chunking using the Web Audio API.
-// Decodes any audio file, downmixes to 16 kHz mono (what Whisper wants),
-// and splits it into fixed-length WAV chunks small enough for the 25 MB API limit.
+// Decodes any audio file, downmixes to 16 kHz mono (what Whisper wants), and
+// splits it into WAV chunks of at most about 2 minutes (3.84 MB). Each chunk is
+// uploaded as its own request, which must stay under Vercel's 4.5 MB request
+// body cap (see src/lib/limits.ts).
 
-import { CHUNK_SECONDS, TARGET_SAMPLE_RATE } from "@/lib/limits";
+import { TARGET_SAMPLE_RATE } from "@/lib/limits";
 import { encodeWav, planChunkRanges } from "@/lib/wav";
 
 export interface AudioChunk {
@@ -11,8 +13,9 @@ export interface AudioChunk {
 }
 
 /**
- * Decode + downsample an audio file to 16 kHz mono and slice it into
- * ~5 minute WAV chunks. Returns one chunk for short files.
+ * Decode + downsample an audio file to 16 kHz mono and slice it into WAV
+ * chunks of up to CHUNK_SECONDS (120 s), each cut at a quiet point where one
+ * is found (see planChunkRanges). Returns one chunk for short files.
  */
 export async function chunkAudioFile(file: File): Promise<AudioChunk[]> {
   const arrayBuffer = await file.arrayBuffer();
@@ -40,9 +43,8 @@ export async function chunkAudioFile(file: File): Promise<AudioChunk[]> {
   const rendered = await offline.startRendering();
 
   const samples = rendered.getChannelData(0);
-  const samplesPerChunk = CHUNK_SECONDS * TARGET_SAMPLE_RATE;
 
-  return planChunkRanges(samples.length, samplesPerChunk).map(([start, end], index) => ({
+  return planChunkRanges(samples, TARGET_SAMPLE_RATE).map(([start, end], index) => ({
     blob: encodeWav(samples.subarray(start, end), TARGET_SAMPLE_RATE),
     index,
   }));

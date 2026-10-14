@@ -1,5 +1,12 @@
 // WAV encoding and chunk slicing for 16-bit mono PCM.
 
+import {
+  CHUNK_SECONDS,
+  MIN_AUDIO_SECONDS,
+  MIN_TAIL_SECONDS,
+  SILENCE_SEARCH_SECONDS,
+} from "./limits";
+
 /** Encode a Float32 PCM buffer into a 16-bit mono WAV Blob. */
 export function encodeWav(samples: Float32Array, sampleRate: number): Blob {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -34,17 +41,87 @@ export function encodeWav(samples: Float32Array, sampleRate: number): Blob {
   return new Blob([view], { type: "audio/wav" });
 }
 
+export interface ChunkPlanOptions {
+  chunkSeconds?: number;
+  minTailSeconds?: number;
+  searchSeconds?: number;
+}
+
+// Length of the frames compared when looking for a quiet place to cut.
+const FRAME_SECONDS = 0.03;
+
 /**
- * Split `totalSamples` into consecutive [start, end) ranges of
- * `samplesPerChunk`. The last range holds whatever is left, however short.
+ * Split decoded audio into consecutive [start, end) sample ranges, one per upload.
+ *
+ * While more than `chunkSeconds` remain, each cut goes at the centre of the
+ * quietest 30 ms frame (frames are 15 ms apart) in the `searchSeconds` before
+ * the nominal cut, so it tends to land between words. The search only looks
+ * backwards, so no chunk is longer than `chunkSeconds`, except that a remainder
+ * shorter than `minTailSeconds` is merged into the last chunk rather than sent
+ * alone (OpenAI rejects audio under 0.1 s). A recording shorter than 0.1 s
+ * throws. The plan depends only on the samples, so the same decode always gives
+ * the same chunks.
  */
 export function planChunkRanges(
-  totalSamples: number,
-  samplesPerChunk: number
+  samples: Float32Array,
+  sampleRate: number,
+  opts: ChunkPlanOptions = {}
 ): Array<[number, number]> {
-  const ranges: Array<[number, number]> = [];
-  for (let start = 0; start < totalSamples; start += samplesPerChunk) {
-    ranges.push([start, Math.min(start + samplesPerChunk, totalSamples)]);
+  const {
+    chunkSeconds = CHUNK_SECONDS,
+    minTailSeconds = MIN_TAIL_SECONDS,
+    searchSeconds = SILENCE_SEARCH_SECONDS,
+  } = opts;
+  const total = samples.length;
+  if (total < Math.round(MIN_AUDIO_SECONDS * sampleRate)) {
+    throw new Error("Recording is too short to transcribe.");
   }
+
+  const perChunk = Math.round(chunkSeconds * sampleRate);
+  const minTail = Math.round(minTailSeconds * sampleRate);
+  const search = Math.round(searchSeconds * sampleRate);
+  const frame = Math.max(1, Math.round(FRAME_SECONDS * sampleRate));
+
+  const ranges: Array<[number, number]> = [];
+  let start = 0;
+  while (total - start > perChunk) {
+    const nominal = start + perChunk;
+    let end = quietestCut(samples, Math.max(start + 1, nominal - search), nominal, frame);
+    if (total - end < minTail) end = total;
+    ranges.push([start, end]);
+    start = end;
+  }
+  if (start < total) ranges.push([start, total]);
   return ranges;
+}
+
+/**
+ * Centre of the lowest-RMS frame among frames centred in [from, to], scanning
+ * back from `to`. Only a strictly quieter frame replaces the best so far, so a
+ * uniform signal is cut at `to` and ties go to the later frame.
+ */
+function quietestCut(samples: Float32Array, from: number, to: number, frame: number): number {
+  const half = Math.floor(frame / 2);
+  const hop = Math.max(1, half);
+  let best = to;
+  let bestPower = Infinity;
+  for (let centre = to; centre >= from; centre -= hop) {
+    const power = meanSquare(samples, centre - half, centre - half + frame);
+    if (power < bestPower) {
+      bestPower = power;
+      best = centre;
+    }
+  }
+  return best;
+}
+
+// Mean of the squared samples in [from, to), clamped to the buffer. Ordering
+// frames by this is the same as ordering them by RMS, without the square root.
+function meanSquare(samples: Float32Array, from: number, to: number): number {
+  const lo = Math.max(0, from);
+  const hi = Math.min(samples.length, to);
+  if (hi <= lo) return 0;
+  let sum = 0;
+  for (let i = lo; i < hi; i++) sum += samples[i] * samples[i];
+  return sum / (hi - lo);
 }

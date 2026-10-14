@@ -2,10 +2,20 @@ import { describe, expect, it } from "vitest";
 import { chunkFilename, joinTranscripts, transcriptFilename } from "./transcript";
 
 describe("joinTranscripts", () => {
-  it("trims each part and separates them with a blank line", () => {
+  it("trims each part and joins them with single spaces", () => {
     expect(joinTranscripts([" first part ", "second\n", "third"])).toBe(
-      "first part\n\nsecond\n\nthird"
+      "first part second third"
     );
+  });
+
+  it("does not break a sentence that spans a chunk cut", () => {
+    expect(joinTranscripts(["We should ship", "on Friday."])).toBe("We should ship on Friday.");
+  });
+
+  it("drops empty and whitespace-only parts", () => {
+    expect(joinTranscripts(["one", "", "  \n ", "two"])).toBe("one two");
+    expect(joinTranscripts(["", " "])).toBe("");
+    expect(joinTranscripts([])).toBe("");
   });
 
   it("returns a single trimmed part unchanged otherwise", () => {
