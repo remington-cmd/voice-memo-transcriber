@@ -17,12 +17,20 @@ export interface AudioChunk {
   index: number;
 }
 
+function throwIfAborted(signal: AbortSignal | undefined) {
+  // signal.throwIfAborted needs Safari 15.4.
+  if (signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
+}
+
 /**
  * Decode an audio file to 16 kHz mono and slice it into WAV chunks of up to
  * CHUNK_SECONDS (120 s), each cut at a quiet point where one is found (see
  * planChunkRanges). Returns one chunk for short files.
+ *
+ * A decode cannot be interrupted, so aborting `signal` takes effect once it
+ * ends: this then rejects with an AbortError instead of encoding the chunks.
  */
-export async function chunkAudioFile(file: File): Promise<AudioChunk[]> {
+export async function chunkAudioFile(file: File, signal?: AbortSignal): Promise<AudioChunk[]> {
   // Safari before 14.1 only has the prefixed, callback-style API.
   if (typeof OfflineAudioContext !== "function") {
     throw new Error(
@@ -31,6 +39,7 @@ export async function chunkAudioFile(file: File): Promise<AudioChunk[]> {
   }
 
   const arrayBuffer = await file.arrayBuffer();
+  throwIfAborted(signal);
 
   // decodeAudioData resamples to its context's rate with the decoder's
   // band-limited resampler, so a 16 kHz offline context yields 16 kHz audio
@@ -42,6 +51,7 @@ export async function chunkAudioFile(file: File): Promise<AudioChunk[]> {
     // Older WebKit rejects with null rather than an Error.
     throw new Error(decodeFailedMessage(file.name), { cause: e });
   }
+  throwIfAborted(signal);
 
   const channels: Float32Array[] = [];
   for (let c = 0; c < decoded.numberOfChannels; c++) channels.push(decoded.getChannelData(c));

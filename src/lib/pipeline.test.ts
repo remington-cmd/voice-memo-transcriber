@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import type { AudioChunk } from "@/app/audio-chunker";
 import { ApiError } from "./api-client";
 import { ChunkError, partialTranscript, transcribeChunks } from "./pipeline";
-import { chunkFilename } from "./transcript";
 
 function makeChunks(n: number): AudioChunk[] {
   return Array.from({ length: n }, (_, index) => ({ blob: new Blob([`c${index}`]), index }));
@@ -20,24 +19,23 @@ async function caught(promise: Promise<unknown>): Promise<ChunkError> {
 }
 
 describe("transcribeChunks", () => {
-  it("uploads chunks in order and reports progress before each", async () => {
+  it("uploads chunks in order, each under its chunk name, with progress before each", async () => {
     const chunks = makeChunks(3);
     const events: string[] = [];
-    const sent: string[] = [];
-    // Mirrors the page: each chunk is uploaded under its chunkFilename.
-    const upload = vi.fn(async (chunk: AudioChunk) => {
-      const filename = chunkFilename("memo.m4a", chunk.index);
+    const upload = vi.fn(async (chunk: AudioChunk, filename: string) => {
       events.push(`upload ${filename}`);
-      sent.push(filename);
       return ` text ${chunk.index} `;
     });
     const onProgress = vi.fn((message: string) => events.push(message));
     const parts: (string | undefined)[] = [];
 
-    const result = await transcribeChunks({ chunks, parts, upload, onProgress });
+    const result = await transcribeChunks({ name: "memo.m4a", chunks, parts, upload, onProgress });
 
-    expect(sent).toEqual(["memo.m4a.part1.wav", "memo.m4a.part2.wav", "memo.m4a.part3.wav"]);
-    expect(upload.mock.calls.map(([chunk]) => chunk)).toEqual(chunks);
+    expect(upload.mock.calls).toEqual([
+      [chunks[0], "memo.m4a.part1.wav"],
+      [chunks[1], "memo.m4a.part2.wav"],
+      [chunks[2], "memo.m4a.part3.wav"],
+    ]);
     expect(events).toEqual([
       "Transcribing chunk 1 of 3…",
       "upload memo.m4a.part1.wav",
@@ -62,7 +60,13 @@ describe("transcribeChunks", () => {
       return "ok";
     };
 
-    await transcribeChunks({ chunks: makeChunks(4), parts: [], upload, onProgress: () => {} });
+    await transcribeChunks({
+      name: "memo.m4a",
+      chunks: makeChunks(4),
+      parts: [],
+      upload,
+      onProgress: () => {},
+    });
     expect(maxInFlight).toBe(1);
   });
 
@@ -78,7 +82,13 @@ describe("transcribeChunks", () => {
     const parts: (string | undefined)[] = [];
 
     const err = await caught(
-      transcribeChunks({ chunks: makeChunks(5), parts, upload, onProgress: () => {} })
+      transcribeChunks({
+        name: "memo.m4a",
+        chunks: makeChunks(5),
+        parts,
+        upload,
+        onProgress: () => {},
+      })
     );
 
     expect(err).toMatchObject({ index: 2, total: 5, completed: 2, cancelled: false, cause });
@@ -101,13 +111,13 @@ describe("transcribeChunks", () => {
     const progress: string[] = [];
     const onProgress = (message: string) => progress.push(message);
 
-    await caught(transcribeChunks({ chunks, parts, upload, onProgress }));
+    await caught(transcribeChunks({ name: "memo.m4a", chunks, parts, upload, onProgress }));
     expect(upload).toHaveBeenCalledTimes(3);
 
     upload.mockClear();
     progress.length = 0;
     failChunk3 = false;
-    const result = await transcribeChunks({ chunks, parts, upload, onProgress });
+    const result = await transcribeChunks({ name: "memo.m4a", chunks, parts, upload, onProgress });
 
     expect(upload).toHaveBeenCalledTimes(3);
     expect(upload.mock.calls.map(([chunk]) => chunk.index)).toEqual([2, 3, 4]);
@@ -125,7 +135,13 @@ describe("transcribeChunks", () => {
       throw new Error("boom");
     });
     const err = await caught(
-      transcribeChunks({ chunks: makeChunks(5), parts, upload, onProgress: () => {} })
+      transcribeChunks({
+        name: "memo.m4a",
+        chunks: makeChunks(5),
+        parts,
+        upload,
+        onProgress: () => {},
+      })
     );
     expect(err).toMatchObject({ index: 3, completed: 3 });
     expect(err.message).toBe("Chunk 4 of 5 failed (3 completed): boom");
@@ -145,6 +161,7 @@ describe("transcribeChunks", () => {
 
     const err = await caught(
       transcribeChunks({
+        name: "memo.m4a",
         chunks: makeChunks(4),
         parts,
         upload,
@@ -169,6 +186,7 @@ describe("transcribeChunks", () => {
 
     const err = await caught(
       transcribeChunks({
+        name: "memo.m4a",
         chunks: makeChunks(4),
         parts,
         upload,

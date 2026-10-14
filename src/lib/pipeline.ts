@@ -1,7 +1,7 @@
 // Drives the chunked transcription of one file.
 
 import type { AudioChunk } from "@/app/audio-chunker";
-import { joinTranscripts } from "./transcript";
+import { chunkFilename, joinTranscripts } from "./transcript";
 
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -40,7 +40,8 @@ export class ChunkError extends Error {
 }
 
 /**
- * Upload chunks one at a time, in order, reporting progress before each.
+ * Upload chunks one at a time, in order, reporting progress before each. Each
+ * is uploaded under its chunkFilename, built from `name`, the source file's name.
  *
  * `parts` is owned by the caller and filled in place: parts[i] is chunk i's raw
  * transcript. Chunks that already have one are skipped, so calling again with
@@ -51,15 +52,17 @@ export class ChunkError extends Error {
  * Any failure, or an abort, throws a ChunkError.
  */
 export async function transcribeChunks({
+  name,
   chunks,
   parts,
   upload,
   onProgress,
   signal,
 }: {
+  name: string;
   chunks: AudioChunk[];
   parts: (string | undefined)[];
-  upload: (chunk: AudioChunk) => Promise<string>;
+  upload: (chunk: AudioChunk, filename: string) => Promise<string>;
   onProgress: (message: string) => void;
   signal?: AbortSignal;
 }): Promise<string[]> {
@@ -79,7 +82,7 @@ export async function transcribeChunks({
     if (signal?.aborted) throw stop(true, signal.reason);
     onProgress(`Transcribing chunk ${chunk.index + 1} of ${chunks.length}…`);
     try {
-      parts[chunk.index] = await upload(chunk);
+      parts[chunk.index] = await upload(chunk, chunkFilename(name, chunk.index));
     } catch (err) {
       throw stop(signal?.aborted ?? false, err);
     }

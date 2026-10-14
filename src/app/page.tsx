@@ -11,7 +11,7 @@ import { ChunkError, partialTranscript, transcribeChunks } from "@/lib/pipeline"
 import { applySummary, createResult, loadResults, removeResult, type Result } from "@/lib/results";
 import { withRetry } from "@/lib/retry";
 import { safeGet, safeSet } from "@/lib/storage";
-import { chunkFilename, joinTranscripts, transcriptFilename } from "@/lib/transcript";
+import { joinTranscripts, transcriptFilename } from "@/lib/transcript";
 
 const LS_KEY = "vmt_results";
 const PW_KEY = "vmt_pw";
@@ -97,11 +97,17 @@ export default function Home() {
   }, [results, loaded]);
 
   // Adopt the list another tab saved, so a stale tab never writes over newer
-  // transcripts. The key is null when another tab cleared storage. Writing the
-  // same value back fires no event, so this cannot loop.
+  // transcripts. The key is null when another tab cleared storage. The list is
+  // read from storage, not from the event: a later write may already have
+  // replaced the event's value, and adopting what is stored now means the
+  // persist effect writes back the same string, which fires no event. If two
+  // tabs change the list within a few ms of each other, the later write wins
+  // and the other change is lost; keeping both would need a merge (F06).
   useEffect(() => {
     function onStorage(e: StorageEvent) {
-      if (e.key === LS_KEY || e.key === null) setResults(loadResults(e.newValue).results);
+      if (e.key === LS_KEY || e.key === null) {
+        setResults(loadResults(safeGet(() => localStorage, LS_KEY)).results);
+      }
     }
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
@@ -223,10 +229,12 @@ export default function Home() {
         if (planUpload({ size: file.size, durationSec }) === "chunked") {
           setProgress("Preparing audio (splitting into chunks)…");
           try {
-            chunks = current.chunks = await chunkAudioFile(file);
+            // A cancel during the decode rejects here, so no chunks are kept for a
+            // job that was stopped before any upload.
+            chunks = current.chunks = await chunkAudioFile(file, signal);
           } catch (e) {
             // Split only for its length: if this browser can't split it, upload it whole as before.
-            if (file.size > DIRECT_LIMIT) throw e;
+            if (signal.aborted || file.size > DIRECT_LIMIT) throw e;
           }
         }
       }
@@ -244,16 +252,14 @@ export default function Home() {
         );
       } else {
         const parts = await transcribeChunks({
+          name: file.name,
           chunks,
           parts: current.parts,
           signal,
           onProgress: setProgress,
-          upload: (chunk) =>
+          upload: (chunk, filename) =>
             withRetry(
-              () =>
-                transcribeBlob(chunk.blob, chunkFilename(file.name, chunk.index), password, {
-                  signal,
-                }),
+              () => transcribeBlob(chunk.blob, filename, password, { signal }),
               {
                 attempts: CHUNK_ATTEMPTS,
                 signal,
@@ -466,7 +472,15 @@ export default function Home() {
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             {status === "working" ? (
-              <button onClick={() => jobAbort.current?.abort()} style={btn("outline")}>
+              <button
+                onClick={() => {
+                  if (!jobAbort.current || jobAbort.current.signal.aborted) return;
+                  jobAbort.current.abort();
+                  // A decode in progress cannot be stopped, so say the click registered.
+                  setProgress("Cancelling…");
+                }}
+                style={btn("outline")}
+              >
                 Cancel
               </button>
             ) : (

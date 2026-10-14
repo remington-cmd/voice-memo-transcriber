@@ -126,7 +126,9 @@ export function applySummary(
       next.summaryCoverage = { wordsUsed: resp.wordsUsed, totalWords: resp.totalWords };
     }
     if (resp.incomplete) next.summaryIncomplete = true;
-    return next;
+    // In the key order loadResults gives, so another tab that reads this list
+    // back serializes the same string and has no reason to write it again.
+    return toResult(next) ?? next;
   });
 }
 

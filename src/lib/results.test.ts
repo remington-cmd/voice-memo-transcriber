@@ -130,6 +130,18 @@ describe("loadResults", () => {
     // The same string written back fires no storage event in other tabs.
     expect(JSON.stringify(loaded.results)).toBe(raw);
   });
+
+  it("round-trips a partial card after it is summarized, and summarized again", () => {
+    let list = [result("p", { partial: true }), result("q")];
+    for (const resp of [
+      { summary: "first" },
+      { summary: "second", truncated: true, wordsUsed: 8000, totalWords: 9000, incomplete: true },
+    ]) {
+      list = applySummary(list, "p", resp);
+      const raw = JSON.stringify(list);
+      expect(JSON.stringify(loadResults(raw).results)).toBe(raw);
+    }
+  });
 });
 
 describe("createResult", () => {
