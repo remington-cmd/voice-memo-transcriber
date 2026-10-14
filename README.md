@@ -19,10 +19,10 @@ Checks: `npm test`, `npm run typecheck`, `npm run build`.
 | Variable | Required | What it does |
 | --- | --- | --- |
 | `OPENAI_API_KEY` | Yes | Server-side key for transcription and summaries. Never sent to the browser. |
-| `ACCESS_PASSWORD` | Strongly recommended | Password both API routes require. Type it into the page's password field. Without it, anyone with the URL can spend your OpenAI credit, and a production server logs a warning. Use at least 20 random characters (`openssl rand -base64 24`). Surrounding whitespace is ignored; a whitespace-only value is treated as a misconfiguration (HTTP 503). |
+| `ACCESS_PASSWORD` | Yes in production | Password both API routes require. Type it into the page's password field. A production server without it answers every API call with HTTP 503 (unless `ALLOW_PUBLIC=1`), because otherwise anyone with the URL could spend your OpenAI credit. `next dev` runs without it. Use at least 20 random characters (`openssl rand -base64 24`). Surrounding whitespace is ignored; a whitespace-only value is treated as a misconfiguration (HTTP 503). |
 | `OPENAI_TRANSCRIBE_MODEL` | No | Transcription model. Defaults to `whisper-1`. See [Models](#models). |
 | `OPENAI_SUMMARY_MODEL` | No | Summary model. Defaults to `gpt-4o-mini`. See [Models](#models). |
-| `ALLOW_PUBLIC` | No | Only read when fail-closed mode is on (`FAIL_CLOSED_IN_PRODUCTION` in `src/lib/server/auth.ts`, off by default). In that mode a production server without `ACCESS_PASSWORD` answers 503 unless `ALLOW_PUBLIC=1`. |
+| `ALLOW_PUBLIC` | No | Set to `1` only if you deliberately want a production deploy with no `ACCESS_PASSWORD` to accept API calls from anyone. Ignored when a password is set. |
 
 ## Models
 

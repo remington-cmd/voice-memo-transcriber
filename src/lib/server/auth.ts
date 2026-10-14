@@ -4,10 +4,10 @@ import { errorResponse } from "./openai";
 
 /**
  * When true, a production server with no ACCESS_PASSWORD refuses API calls
- * with a 503 unless ALLOW_PUBLIC=1. Off by default so existing deploys that
- * run without a password keep working; see decision D1 before flipping it.
+ * with a 503 unless ALLOW_PUBLIC=1, so a missing password can never turn the
+ * routes into an open proxy for the OpenAI key. `next dev` stays open.
  */
-export const FAIL_CLOSED_IN_PRODUCTION: boolean = false;
+export const FAIL_CLOSED_IN_PRODUCTION: boolean = true;
 
 /** Shorter passwords still work but log a warning (F18). */
 const MIN_RECOMMENDED_LENGTH = 16;

@@ -33,10 +33,10 @@ async function expectError(res: Response | null, status: number, code: string) {
 }
 
 describe("checkAccess without a password", () => {
-  it("defaults to failing open", () => {
-    expect(FAIL_CLOSED_IN_PRODUCTION).toBe(false);
-    silenceWarn();
-    expect(checkAccess(request(), { NODE_ENV: "production" })).toBeNull();
+  it("defaults to failing closed in production and open in development", async () => {
+    expect(FAIL_CLOSED_IN_PRODUCTION).toBe(true);
+    await expectError(checkAccess(request(), { NODE_ENV: "production" }), 503, "misconfigured");
+    expect(checkAccess(request(), { NODE_ENV: "development" })).toBeNull();
   });
 
   it("allows an unset password, warning once in production", () => {
