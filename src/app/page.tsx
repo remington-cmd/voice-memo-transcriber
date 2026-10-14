@@ -1,10 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useDropzone } from "react-dropzone";
+import { useDropzone, type FileRejection } from "react-dropzone";
 import { chunkAudioFile, type AudioChunk } from "./audio-chunker";
 import { requestSummary, transcribeBlob } from "@/lib/api-client";
-import { MAX_SIZE, shouldChunk } from "@/lib/limits";
+import { ACCEPT, ACCEPTED_EXTENSIONS, MAX_SIZE_LABEL, rejectionMessage } from "@/lib/files";
+import { assessLongFile, DIRECT_LIMIT, isIOS, MAX_SIZE, planUpload } from "@/lib/limits";
+import { readDuration } from "@/lib/media";
 import { ChunkError, partialTranscript, transcribeChunks } from "@/lib/pipeline";
 import { applySummary, createResult, loadResults, removeResult, type Result } from "@/lib/results";
 import { withRetry } from "@/lib/retry";
@@ -48,6 +50,8 @@ export default function Home() {
 
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState<"idle" | "working" | "error">("idle");
+  // For onDrop, which is created once and would otherwise see the first status only.
+  const statusRef = useRef(status);
   const [progress, setProgress] = useState("");
   const [results, setResults] = useState<Result[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -63,6 +67,10 @@ export default function Home() {
   // Aborts the running job; null when no job is running.
   const jobAbort = useRef<AbortController | null>(null);
   const wakeLock = useRef<WakeLockSentinel | null>(null);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   // Load password from sessionStorage and transcripts from localStorage on mount.
   // Storage may be blocked or hold anything, so none of this can throw.
@@ -148,9 +156,15 @@ export default function Home() {
     setResume(null);
   }
 
-  const onDrop = useCallback((accepted: File[], rejected: { file: File }[]) => {
+  const onDrop = useCallback((accepted: File[], rejected: FileRejection[]) => {
+    // The zone stays enabled while working. A drop then must not replace the
+    // file and re-enable Transcribe, which would start a second job.
+    if (statusRef.current === "working") {
+      setError("Wait for the current file to finish.");
+      return;
+    }
     if (rejected.length > 0) {
-      setError("File too large (max 500 MB) or unsupported type. Use .m4a, .mp3, .wav, .mp4, .ogg.");
+      setError(rejectionMessage(rejected));
       return;
     }
     setError(null);
@@ -161,20 +175,15 @@ export default function Home() {
     setStatus("idle");
   }, []);
 
+  // Not `disabled` while working: that drops the zone's drop handler, and the
+  // browser then opens a dropped file in place of the page. onDrop ignores it.
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    accept: {
-      "audio/x-m4a": [".m4a"],
-      "audio/mp4": [".mp4", ".m4a"],
-      "audio/mpeg": [".mp3"],
-      "audio/wav": [".wav"],
-      "audio/webm": [".webm"],
-      "audio/ogg": [".ogg"],
-      "video/mp4": [".mp4"],
-    },
+    accept: ACCEPT,
     maxSize: MAX_SIZE,
-    maxFiles: 1,
-    disabled: status === "working",
+    multiple: false,
+    noClick: status === "working",
+    noKeyboard: status === "working",
   });
 
   async function run() {
@@ -195,8 +204,34 @@ export default function Home() {
 
     try {
       let fullTranscript: string;
+      // Resume reuses the chunks already decoded; no chunks means a direct upload.
+      let chunks = current.chunks;
 
-      if (!shouldChunk(file.size)) {
+      if (!chunks) {
+        // Read the length before any decode: running out of memory while
+        // decoding crashes the tab, which no catch can handle.
+        setProgress("Checking the recording's length…");
+        const durationSec = await readDuration(file);
+        if (signal.aborted) throw new DOMException("The operation was aborted.", "AbortError");
+        const ios = isIOS(navigator.userAgent, navigator.maxTouchPoints ?? 0);
+        const check = assessLongFile(durationSec, ios);
+        if (check.warn && !window.confirm(check.message)) {
+          setStatus("idle");
+          setProgress("");
+          return;
+        }
+        if (planUpload({ size: file.size, durationSec }) === "chunked") {
+          setProgress("Preparing audio (splitting into chunks)…");
+          try {
+            chunks = current.chunks = await chunkAudioFile(file);
+          } catch (e) {
+            // Split only for its length: if this browser can't split it, upload it whole as before.
+            if (file.size > DIRECT_LIMIT) throw e;
+          }
+        }
+      }
+
+      if (!chunks) {
         setProgress("Transcribing…");
         fullTranscript = await withRetry(
           () => transcribeBlob(file, file.name, password, { signal }),
@@ -208,11 +243,6 @@ export default function Home() {
           }
         );
       } else {
-        if (!current.chunks) {
-          setProgress("Preparing audio (splitting into chunks)…");
-          current.chunks = await chunkAudioFile(file);
-        }
-        const chunks = current.chunks;
         const parts = await transcribeChunks({
           chunks,
           parts: current.parts,
@@ -343,11 +373,13 @@ export default function Home() {
       </div>
 
       <div style={{ marginBottom: 20 }}>
-        <label style={{ fontSize: 13, color: "#666", display: "block", marginBottom: 6 }}>
+        <label htmlFor="pw" style={{ fontSize: 13, color: "#666", display: "block", marginBottom: 6 }}>
           Access password <span style={{ color: "#444" }}>(leave blank if none is set)</span>
         </label>
         <input
+          id="pw"
           type="password"
+          autoComplete="current-password"
           value={password}
           onChange={(e) => {
             setPassword(e.target.value);
@@ -386,26 +418,32 @@ export default function Home() {
           {isDragActive ? "Drop it here…" : "Drag & drop your audio file here"}
         </p>
         <p style={{ margin: "8px 0 16px", color: "#555", fontSize: 14 }}>
-          .m4a · .mp3 · .wav · .mp4 · .ogg · up to 500 MB
+          {ACCEPTED_EXTENSIONS.join(" · ")} · up to {MAX_SIZE_LABEL}
         </p>
-        <button style={btn("outline")}>Browse files</button>
+        {/* The zone itself takes focus and opens the picker, so this is not a second tab stop. */}
+        <button type="button" tabIndex={-1} style={btn("outline")}>
+          Browse files
+        </button>
       </div>
 
-      {error && (
-        <div
-          style={{
-            marginTop: 16,
-            padding: "12px 16px",
-            background: "#2a1515",
-            border: "1px solid #5a2020",
-            borderRadius: 8,
-            color: "#f87171",
-            fontSize: 14,
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {/* Always rendered, so screen readers announce each new message. */}
+      <div role="alert">
+        {error && (
+          <div
+            style={{
+              marginTop: 16,
+              padding: "12px 16px",
+              background: "#2a1515",
+              border: "1px solid #5a2020",
+              borderRadius: 8,
+              color: "#f87171",
+              fontSize: 14,
+            }}
+          >
+            {error}
+          </div>
+        )}
+      </div>
 
       {file && (
         <div
@@ -437,6 +475,7 @@ export default function Home() {
                   setFile(null);
                   forgetJob();
                 }}
+                aria-label="Remove selected file"
                 style={{ background: "none", border: "none", color: "#666", cursor: "pointer", fontSize: 18, lineHeight: 1 }}
               >
                 ×
@@ -453,21 +492,23 @@ export default function Home() {
         </div>
       )}
 
-      {status === "working" && progress && (
-        <div
-          style={{
-            marginTop: 12,
-            padding: "10px 16px",
-            background: "#15203a",
-            border: "1px solid #243a66",
-            borderRadius: 8,
-            color: "#9dc0ff",
-            fontSize: 13,
-          }}
-        >
-          {progress}
-        </div>
-      )}
+      <div role="status" aria-live="polite">
+        {status === "working" && progress && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: "10px 16px",
+              background: "#15203a",
+              border: "1px solid #243a66",
+              borderRadius: 8,
+              color: "#9dc0ff",
+              fontSize: 13,
+            }}
+          >
+            {progress}
+          </div>
+        )}
+      </div>
 
       {results.length > 0 && (
         <div style={{ marginTop: 40 }}>
@@ -538,6 +579,7 @@ export default function Home() {
                     onClick={() => deleteResult(r.id)}
                     style={{ background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "6px 4px" }}
                     title="Delete"
+                    aria-label={`Delete transcript ${r.filename}`}
                   >
                     ×
                   </button>
@@ -598,8 +640,9 @@ export default function Home() {
         }}
       >
         <strong style={{ color: "#999" }}>Tip:</strong> For Spotify/podcast audio, record it with
-        Audacity (Mac: BlackHole, Windows: WASAPI loopback) and export an .mp3 — then drop it here.
-        Long files transcribe in 2-minute chunks automatically.
+        Audacity (Mac: BlackHole, Windows: WASAPI loopback) and export an .mp3, then drop it here.
+        Files over 4 MB or 10 minutes are transcribed in 2-minute chunks automatically; recordings
+        over ~2½ hours may be too long for the browser to split.
       </div>
     </main>
   );

@@ -1,4 +1,4 @@
-// WAV encoding and chunk slicing for 16-bit mono PCM.
+// Downmixing, WAV encoding and chunk slicing for 16-bit mono PCM.
 
 import {
   CHUNK_SECONDS,
@@ -39,6 +39,23 @@ export function encodeWav(samples: Float32Array, sampleRate: number): Blob {
   }
 
   return new Blob([view], { type: "audio/wav" });
+}
+
+/**
+ * Average decoded channels into one, sample by sample. A single channel is
+ * returned as it is, without a copy, since a long recording is large.
+ */
+export function downmixToMono(channels: readonly Float32Array[]): Float32Array {
+  if (channels.length === 0) return new Float32Array(0);
+  if (channels.length === 1) return channels[0];
+  const length = channels[0].length;
+  const mono = new Float32Array(length);
+  for (const channel of channels) {
+    for (let i = 0; i < length; i++) mono[i] += channel[i];
+  }
+  const scale = 1 / channels.length;
+  for (let i = 0; i < length; i++) mono[i] *= scale;
+  return mono;
 }
 
 export interface ChunkPlanOptions {

@@ -1,4 +1,4 @@
-// Size and audio limits shared by the page and the chunker.
+// Size, length and audio limits shared by the page and the chunker.
 //
 // Every upload is a single request to a Vercel function, and Vercel rejects a
 // request body over about 4.5 MB with a 413 before the route runs. Both ways
@@ -34,7 +34,74 @@ export function wavBytes(seconds: number, rate = TARGET_SAMPLE_RATE): number {
   return 44 + seconds * rate * 2;
 }
 
-/** True when a file is too big to upload directly and must be split first. */
-export function shouldChunk(size: number): boolean {
-  return size > DIRECT_LIMIT;
+/**
+ * Files longer than this are split even when they are small enough to upload
+ * whole. Whisper's time grows with the audio's length, not its size, so a long
+ * low-bitrate file could outlast the transcribe route's 60 s maxDuration; a
+ * 2-minute chunk stays well inside it.
+ */
+export const DIRECT_MAX_SECONDS = 600;
+
+/**
+ * Lengths above which splitting in the browser may run out of memory and crash
+ * the tab, which no error handler can catch. The whole recording is decoded in
+ * memory at once: in Chromium that peaked at about 1.7 GB for an hour of mono
+ * audio and 8 GB for a 3 h stereo MP3. iOS gives a tab far less; its figure is
+ * an estimate, not measured.
+ */
+export const LONG_FILE_SOFT_SECONDS = { desktop: 9000, ios: 3600 } as const;
+
+export type UploadPlan = "direct" | "chunked";
+
+/**
+ * Upload a file whole, or decode and split it into chunks first: chunked when
+ * it is over DIRECT_LIMIT bytes or longer than DIRECT_MAX_SECONDS. A null
+ * duration (the browser could not read it) is decided by size alone.
+ */
+export function planUpload({
+  size,
+  durationSec,
+}: {
+  size: number;
+  durationSec: number | null;
+}): UploadPlan {
+  if (size > DIRECT_LIMIT) return "chunked";
+  return durationSec !== null && durationSec > DIRECT_MAX_SECONDS ? "chunked" : "direct";
+}
+
+/**
+ * True on an iPhone, iPod or iPad. iPadOS asks for desktop sites by default and
+ * then reports itself as a Mac, so a "Mac" with a touch screen counts too.
+ */
+export function isIOS(userAgent: string, maxTouchPoints: number): boolean {
+  if (/iPhone|iPad|iPod/.test(userAgent)) return true;
+  return /Macintosh/.test(userAgent) && maxTouchPoints > 1;
+}
+
+export type LongFileCheck = { warn: false } | { warn: true; message: string };
+
+/**
+ * Whether to ask before splitting a recording this long, and what to ask.
+ * Nothing is asked at or under the soft limit, or when the length is unknown.
+ */
+export function assessLongFile(durationSec: number | null, ios: boolean): LongFileCheck {
+  const limit = ios ? LONG_FILE_SOFT_SECONDS.ios : LONG_FILE_SOFT_SECONDS.desktop;
+  if (durationSec === null || durationSec <= limit) return { warn: false };
+  const where = ios ? "on an iPhone or iPad" : "in the browser";
+  return {
+    warn: true,
+    message:
+      `This recording is ${formatDuration(durationSec)} long. Splitting recordings over ` +
+      `${formatDuration(limit)} ${where} can run out of memory and crash the tab, losing ` +
+      `all progress. Splitting the file into shorter parts first is safer. Continue anyway?`,
+  };
+}
+
+/** "45 min", "1 h" or "2 h 30 min", rounding up to the next minute. */
+function formatDuration(seconds: number): string {
+  const minutes = Math.ceil(seconds / 60);
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h === 0) return `${m} min`;
+  return m === 0 ? `${h} h` : `${h} h ${m} min`;
 }

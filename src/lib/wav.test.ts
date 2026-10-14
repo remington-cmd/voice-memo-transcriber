@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CHUNK_SECONDS, MAX_CHUNK_SECONDS, SILENCE_SEARCH_SECONDS } from "./limits";
-import { encodeWav, planChunkRanges } from "./wav";
+import { downmixToMono, encodeWav, planChunkRanges } from "./wav";
 
 async function view(blob: Blob): Promise<DataView> {
   return new DataView(await blob.arrayBuffer());
@@ -39,6 +39,47 @@ describe("encodeWav", () => {
     expect(v.getInt16(44, true)).toBe(0x7fff);
     expect(v.getInt16(46, true)).toBe(-0x8000);
     expect(v.getInt16(48, true)).toBe(0);
+  });
+});
+
+describe("downmixToMono", () => {
+  it("passes a single channel through unchanged", () => {
+    const mono = new Float32Array([0.5, -0.25, 0, 1]);
+    expect(Array.from(downmixToMono([mono]))).toEqual([0.5, -0.25, 0, 1]);
+    // No copy of a long recording
+    expect(downmixToMono([mono])).toBe(mono);
+  });
+
+  it("averages stereo sample by sample", () => {
+    const left = new Float32Array([1, 0.5, -1, 0]);
+    const right = new Float32Array([0, 0.5, 1, -0.5]);
+    expect(Array.from(downmixToMono([left, right]))).toEqual([0.5, 0.5, 0, -0.25]);
+  });
+
+  it("averages any number of channels", () => {
+    const out = downmixToMono([
+      new Float32Array([0.75]),
+      new Float32Array([0]),
+      new Float32Array([-0.75]),
+      new Float32Array([0.5]),
+    ]);
+    expect(Array.from(out)).toEqual([0.125]);
+  });
+
+  it("keeps the input length", () => {
+    const length = 16000 * 3 + 7;
+    expect(downmixToMono([new Float32Array(length)])).toHaveLength(length);
+    expect(downmixToMono([new Float32Array(length), new Float32Array(length)])).toHaveLength(
+      length
+    );
+  });
+
+  it("does not change the input channels", () => {
+    const left = new Float32Array([1, 1]);
+    const right = new Float32Array([0, 0]);
+    downmixToMono([left, right]);
+    expect(Array.from(left)).toEqual([1, 1]);
+    expect(Array.from(right)).toEqual([0, 0]);
   });
 });
 
