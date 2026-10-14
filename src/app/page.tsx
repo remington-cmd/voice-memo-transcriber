@@ -1,11 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useDropzone, type FileRejection } from "react-dropzone";
+import type { FileRejection } from "react-dropzone";
 import { chunkAudioFile, type AudioChunk } from "./audio-chunker";
+import { DropZone } from "./drop-zone";
+import { btn } from "./styles";
 import { requestSummary, transcribeBlob } from "@/lib/api-client";
-import { ACCEPT, ACCEPTED_EXTENSIONS, MAX_SIZE_LABEL, rejectionMessage } from "@/lib/files";
-import { assessLongFile, DIRECT_LIMIT, isIOS, MAX_SIZE, planUpload } from "@/lib/limits";
+import { rejectionMessage } from "@/lib/files";
+import { assessLongFile, DIRECT_LIMIT, isIOS, planUpload } from "@/lib/limits";
 import { readDuration } from "@/lib/media";
 import { ChunkError, partialTranscript, transcribeChunks } from "@/lib/pipeline";
 import { applySummary, createResult, loadResults, removeResult, type Result } from "@/lib/results";
@@ -180,17 +182,6 @@ export default function Home() {
     setFile(next);
     setStatus("idle");
   }, []);
-
-  // Not `disabled` while working: that drops the zone's drop handler, and the
-  // browser then opens a dropped file in place of the page. onDrop ignores it.
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({
-    onDrop,
-    accept: ACCEPT,
-    maxSize: MAX_SIZE,
-    multiple: false,
-    noClick: status === "working",
-    noKeyboard: status === "working",
-  });
 
   async function run() {
     if (!file) return;
@@ -405,32 +396,7 @@ export default function Home() {
         />
       </div>
 
-      <div
-        {...getRootProps()}
-        style={{
-          border: `2px dashed ${isDragActive ? "#4f8ef7" : "#333"}`,
-          borderRadius: 12,
-          padding: "48px 24px",
-          textAlign: "center",
-          cursor: "pointer",
-          background: isDragActive ? "rgba(79,142,247,0.05)" : "#1a1a1a",
-          transition: "all 0.2s",
-          opacity: status === "working" ? 0.5 : 1,
-        }}
-      >
-        <input {...getInputProps()} />
-        <div style={{ fontSize: 40, marginBottom: 12 }}>🎵</div>
-        <p style={{ margin: 0, color: "#ccc", fontWeight: 500 }}>
-          {isDragActive ? "Drop it here…" : "Drag & drop your audio file here"}
-        </p>
-        <p style={{ margin: "8px 0 16px", color: "#555", fontSize: 14 }}>
-          {ACCEPTED_EXTENSIONS.join(" · ")} · up to {MAX_SIZE_LABEL}
-        </p>
-        {/* The zone itself takes focus and opens the picker, so this is not a second tab stop. */}
-        <button type="button" tabIndex={-1} style={btn("outline")}>
-          Browse files
-        </button>
-      </div>
+      <DropZone onDrop={onDrop} working={status === "working"} />
 
       {/* Always rendered, so screen readers announce each new message. */}
       <div role="alert">
@@ -660,27 +626,4 @@ export default function Home() {
       </div>
     </main>
   );
-}
-
-function btn(variant: "primary" | "outline"): React.CSSProperties {
-  return variant === "primary"
-    ? {
-        background: "#4f8ef7",
-        color: "#fff",
-        border: "none",
-        borderRadius: 6,
-        padding: "8px 16px",
-        cursor: "pointer",
-        fontWeight: 500,
-        fontSize: 14,
-      }
-    : {
-        background: "none",
-        color: "#ccc",
-        border: "1px solid #444",
-        borderRadius: 6,
-        padding: "6px 14px",
-        cursor: "pointer",
-        fontSize: 13,
-      };
 }
