@@ -5,13 +5,14 @@ import { truncateWords } from "@/lib/text";
 export const maxDuration = 30;
 
 export async function POST(request: NextRequest) {
+  // Auth first, so anonymous callers cannot probe the server configuration.
+  const denied = checkAccess(request);
+  if (denied) return denied;
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return NextResponse.json({ error: "OPENAI_API_KEY is not set." }, { status: 500 });
   }
-
-  const denied = checkAccess(request);
-  if (denied) return denied;
 
   let body: { transcript?: string };
   try {

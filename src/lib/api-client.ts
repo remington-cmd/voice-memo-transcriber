@@ -4,8 +4,10 @@ export interface SummaryResponse {
   summary: string;
 }
 
+// Header values must be Latin-1, so the password is percent-encoded and the
+// server decodes it. This keeps passwords like "café€" from making fetch throw.
 export function authHeaders(password: string): Record<string, string> {
-  return password ? { "x-access-password": password } : {};
+  return password ? { "x-access-password": encodeURIComponent(password) } : {};
 }
 
 export async function transcribeBlob(

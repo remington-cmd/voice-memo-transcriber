@@ -18,6 +18,15 @@ describe("authHeaders", () => {
     expect(authHeaders("secret")).toEqual({ "x-access-password": "secret" });
     expect(authHeaders("")).toEqual({});
   });
+
+  it("encodes any Unicode password into a legal ASCII header value", () => {
+    const password = "caf\u00e9\u20ac\u2019\u2014\u{1F600}";
+    const value = authHeaders(password)["x-access-password"];
+
+    expect(value).toMatch(/^[\x21-\x7e]*$/);
+    expect(decodeURIComponent(value)).toBe(password);
+    expect(() => new Headers(authHeaders(password))).not.toThrow();
+  });
 });
 
 describe("transcribeBlob", () => {

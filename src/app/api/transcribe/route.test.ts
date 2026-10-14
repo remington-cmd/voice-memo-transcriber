@@ -43,7 +43,19 @@ describe("POST /api/transcribe", () => {
     const res = await POST(request({ "x-access-password": "wrong" }));
 
     expect(res.status).toBe(401);
-    expect(await res.json()).toEqual({ error: "Unauthorized" });
+    expect(await res.json()).toEqual({ code: "bad_password", error: "Unauthorized" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("checks the password before reporting a missing OPENAI_API_KEY", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "");
+    vi.stubEnv("ACCESS_PASSWORD", "right");
+    const fetchMock = stubUpstream();
+
+    const res = await POST(request({ "x-access-password": "wrong" }));
+
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ code: "bad_password" });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
