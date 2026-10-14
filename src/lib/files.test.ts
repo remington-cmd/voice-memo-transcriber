@@ -75,4 +75,30 @@ describe("decodeFailedMessage", () => {
     expect(decodeFailedMessage(".hidden")).toContain("decode this file for splitting");
     expect(decodeFailedMessage("memo.")).toContain("decode this file for splitting");
   });
+
+  it("calls a failed .mp3 damaged instead of saying to convert it to MP3", () => {
+    expect(decodeFailedMessage("corrupt5mb.MP3")).toBe(
+      "This browser couldn't decode this .mp3 file for splitting. It may be damaged. Try exporting it again."
+    );
+  });
+
+  it("names Lossless for a failed .m4a, and does not say to convert it to .m4a", () => {
+    const message = decodeFailedMessage("New Recording.m4a");
+    expect(message).toBe(
+      "This browser couldn't decode this .m4a file for splitting. It may be damaged or recorded as Lossless. Try exporting it again, or convert it to MP3."
+    );
+    expect(message).not.toContain("AAC (.m4a)");
+  });
+
+  it("keeps the advice to convert for formats every browser may not decode", () => {
+    for (const name of ["memo.webm", "memo.wav", "clip.mp4", "memo"]) {
+      expect(decodeFailedMessage(name)).toContain("Convert it to MP3 or AAC (.m4a), or try Chrome.");
+    }
+  });
+
+  it("uses no em-dashes", () => {
+    for (const name of ["a.mp3", "a.m4a", "a.ogg", "a"]) {
+      expect(decodeFailedMessage(name)).not.toContain("—");
+    }
+  });
 });

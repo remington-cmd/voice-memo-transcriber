@@ -46,11 +46,21 @@ export function rejectionMessage(rejections: readonly Rejection[]): string {
 
 /**
  * Shown when the browser can't decode a file to split it, naming its
- * extension when it has one.
+ * extension when it has one. Current browsers all decode MP3, so a failed
+ * .mp3 is most likely damaged; a failed .m4a may also be Lossless (ALAC),
+ * which Chrome likely can't decode. Anything else gets the advice to convert.
  */
 export function decodeFailedMessage(filename: string): string {
   const dot = filename.lastIndexOf(".");
   const ext = dot > 0 ? filename.slice(dot + 1).toLowerCase() : "";
   const what = ext && /^[a-z0-9]+$/.test(ext) ? `this .${ext} file` : "this file";
-  return `This browser couldn't decode ${what} for splitting. Convert it to MP3 or AAC (.m4a), or try Chrome.`;
+  const lead = `This browser couldn't decode ${what} for splitting.`;
+  switch (ext) {
+    case "mp3":
+      return `${lead} It may be damaged. Try exporting it again.`;
+    case "m4a":
+      return `${lead} It may be damaged or recorded as Lossless. Try exporting it again, or convert it to MP3.`;
+    default:
+      return `${lead} Convert it to MP3 or AAC (.m4a), or try Chrome.`;
+  }
 }
