@@ -1,172 +1,364 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { useDropzone } from "react-dropzone";
-import { chunkAudioFile } from "./audio-chunker";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { FileRejection } from "react-dropzone";
+import { chunkAudioFile, type AudioChunk } from "./audio-chunker";
+import { DropZone } from "./drop-zone";
+import { btn } from "./styles";
+import { requestSummary, transcribeBlob } from "@/lib/api-client";
+import { isAacFile, rejectionMessage } from "@/lib/files";
+import { assessLongFile, DIRECT_LIMIT, isIOS, planUpload } from "@/lib/limits";
+import { readDuration } from "@/lib/media";
+import { ChunkError, partialTranscript, transcribeChunks } from "@/lib/pipeline";
+import { applySummary, createResult, loadResults, removeResult, type Result } from "@/lib/results";
+import { withRetry } from "@/lib/retry";
+import { safeGet, safeSet } from "@/lib/storage";
+import { joinTranscripts, transcriptFilename } from "@/lib/transcript";
 
-const DIRECT_LIMIT = 24 * 1024 * 1024;
-const MAX_SIZE = 500 * 1024 * 1024;
 const LS_KEY = "vmt_results";
+const PW_KEY = "vmt_pw";
 
-interface Result {
-  filename: string;
-  transcript: string;
-  at: string; // ISO string for serialization
-  summary?: string;
+const SAVE_ERROR =
+  "Browser storage is full or blocked: the newest transcript is shown but NOT saved. Download it (↓ .txt), then delete old transcripts.";
+
+// Calls per upload. A 504 on a long direct file tends to repeat, so that gets
+// one retry; a 2-minute chunk gets three.
+const DIRECT_ATTEMPTS = 2;
+const CHUNK_ATTEMPTS = 4;
+
+/**
+ * Work kept between runs on the same file, so Resume continues at the chunk
+ * that failed without decoding again or paying for finished chunks twice.
+ */
+interface Job {
+  /** Which file this belongs to: name, size and lastModified. */
+  key: string;
+  /** Decoded chunks, kept after a failure until success or another file. */
+  chunks?: AudioChunk[];
+  /** Transcript of each finished chunk, by index. */
+  parts: (string | undefined)[];
+  /** Id of the partial result saved for this job, replaced on each stop. */
+  partialId?: string;
+}
+
+function fileKey(file: File): string {
+  return `${file.name}:${file.size}:${file.lastModified}`;
 }
 
 export default function Home() {
-  // null = not yet loaded from sessionStorage (avoid hydration mismatch)
-  const [password, setPassword] = useState<string | null>(null);
-  const [pwInput, setPwInput] = useState("");
+  // false until storage has been read on mount (avoids a hydration mismatch)
+  const [loaded, setLoaded] = useState(false);
+  const [password, setPassword] = useState("");
 
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState<"idle" | "working" | "error">("idle");
+  // For onDrop, which is created once and would otherwise see the first status only.
+  const statusRef = useRef(status);
   const [progress, setProgress] = useState("");
   const [results, setResults] = useState<Result[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState<number | null>(null);
-  const [summarizing, setSummarizing] = useState<number | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [copied, setCopied] = useState<{ id: string; ok: boolean } | null>(null);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ids of the transcripts with a summary request in flight
+  const [summarizing, setSummarizing] = useState<ReadonlySet<string>>(() => new Set());
+  const transcriptsHeading = useRef<HTMLHeadingElement>(null);
+  const job = useRef<Job | null>(null);
+  // Where Resume would continue, shown on the button. Null when there is nothing to resume.
+  const [resume, setResume] = useState<{ chunk: number; total: number } | null>(null);
+  // Aborts the running job; null when no job is running.
+  const jobAbort = useRef<AbortController | null>(null);
+  const wakeLock = useRef<WakeLockSentinel | null>(null);
 
-  // Load password from sessionStorage and transcripts from localStorage on mount
   useEffect(() => {
-    const savedPw = sessionStorage.getItem("vmt_pw") ?? "";
-    setPassword(savedPw);
-    setPwInput(savedPw);
+    statusRef.current = status;
+  }, [status]);
+
+  // Load password from sessionStorage and transcripts from localStorage on mount.
+  // Storage may be blocked or hold anything, so none of this can throw.
+  useEffect(() => {
+    setPassword(safeGet(() => sessionStorage, PW_KEY) ?? "");
+    const raw = safeGet(() => localStorage, LS_KEY);
+    const { results: saved, corrupt } = loadResults(raw);
+    // The persist effect is about to overwrite an unreadable value, so keep a copy.
+    if (corrupt && raw) safeSet(() => localStorage, `${LS_KEY}_corrupt_${Date.now()}`, raw);
+    setResults(saved);
+    setLoaded(true);
+    // Best effort: ask the browser not to evict saved transcripts. Most tabs are refused.
     try {
-      const saved = localStorage.getItem(LS_KEY);
-      if (saved) setResults(JSON.parse(saved));
+      navigator.storage?.persist?.().catch(() => {});
     } catch {}
   }, []);
 
-  // Persist transcripts whenever results change (skip before mount completes)
+  // Persist transcripts whenever they change, once loaded. A failed write keeps
+  // everything on screen and says it is not saved.
   useEffect(() => {
-    if (password !== null) {
-      localStorage.setItem(LS_KEY, JSON.stringify(results));
-    }
-  }, [results, password]);
+    if (!loaded) return;
+    const ok = safeSet(() => localStorage, LS_KEY, JSON.stringify(results));
+    setSaveError(ok ? null : SAVE_ERROR);
+  }, [results, loaded]);
 
-  const onDrop = useCallback((accepted: File[], rejected: { file: File }[]) => {
+  // Adopt the list another tab saved, so a stale tab never writes over newer
+  // transcripts. The key is null when another tab cleared storage. The list is
+  // read from storage, not from the event: a later write may already have
+  // replaced the event's value, and adopting what is stored now means the
+  // persist effect writes back the same string, which fires no event. If two
+  // tabs change the list within a few ms of each other, the later write wins
+  // and the other change is lost; keeping both would need a merge (F06).
+  useEffect(() => {
+    function onStorage(e: StorageEvent) {
+      if (e.key === LS_KEY || e.key === null) {
+        setResults(loadResults(safeGet(() => localStorage, LS_KEY)).results);
+      }
+    }
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  // While a job runs, warn before the page is closed or reloaded, and get the
+  // screen wake lock back when the page is shown again (hiding it releases the lock).
+  useEffect(() => {
+    if (status !== "working") return;
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+    function onVisibilityChange() {
+      if (document.visibilityState === "visible") acquireWakeLock();
+    }
+    window.addEventListener("beforeunload", onBeforeUnload);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [status]);
+
+  // Best effort: keep a phone's screen on while a job runs, since a locked iPhone
+  // suspends the page mid-upload. Unsupported or refused requests are ignored.
+  function acquireWakeLock() {
+    if (wakeLock.current && !wakeLock.current.released) return;
+    try {
+      navigator.wakeLock?.request("screen").then(
+        (lock) => {
+          // The job may have ended while the request was pending.
+          if (!jobAbort.current) {
+            lock.release().catch(() => {});
+            return;
+          }
+          wakeLock.current?.release().catch(() => {});
+          wakeLock.current = lock;
+        },
+        () => {}
+      );
+    } catch {}
+  }
+
+  function releaseWakeLock() {
+    wakeLock.current?.release().catch(() => {});
+    wakeLock.current = null;
+  }
+
+  function forgetJob() {
+    job.current = null;
+    setResume(null);
+  }
+
+  const onDrop = useCallback((accepted: File[], rejected: FileRejection[]) => {
+    // The zone stays enabled while working. A drop then must not replace the
+    // file and re-enable Transcribe, which would start a second job.
+    if (statusRef.current === "working") {
+      setError("Wait for the current file to finish.");
+      return;
+    }
     if (rejected.length > 0) {
-      setError("File too large (max 500 MB) or unsupported type. Use .m4a, .mp3, .wav, .mp4, .ogg.");
+      setError(rejectionMessage(rejected));
       return;
     }
     setError(null);
-    setFile(accepted[0] ?? null);
+    const next = accepted[0] ?? null;
+    // Dropping the same file again keeps its finished chunks for Resume.
+    if (!next || job.current?.key !== fileKey(next)) forgetJob();
+    setFile(next);
     setStatus("idle");
   }, []);
 
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({
-    onDrop,
-    accept: {
-      "audio/x-m4a": [".m4a"],
-      "audio/mp4": [".mp4", ".m4a"],
-      "audio/mpeg": [".mp3"],
-      "audio/wav": [".wav"],
-      "audio/webm": [".webm"],
-      "audio/ogg": [".ogg"],
-      "video/mp4": [".mp4"],
-    },
-    maxSize: MAX_SIZE,
-    maxFiles: 1,
-    disabled: status === "working",
-  });
-
-  function authHeaders(): Record<string, string> {
-    return password ? { "x-access-password": password } : {};
-  }
-
-  async function transcribeBlob(blob: Blob, filename: string): Promise<string> {
-    const fd = new FormData();
-    fd.append("file", blob, filename);
-    const res = await fetch("/api/transcribe", { method: "POST", headers: authHeaders(), body: fd });
-    const data = await res.json();
-    if (res.status === 401) throw new Error("Access denied — check your password.");
-    if (!res.ok) throw new Error(data.error ?? "Transcription failed");
-    return data.transcript as string;
-  }
-
   async function run() {
     if (!file) return;
-    sessionStorage.setItem("vmt_pw", password ?? "");
+    const controller = new AbortController();
+    const { signal } = controller;
+    jobAbort.current = controller;
+    // Before the first await, while the click still counts as a user gesture.
+    acquireWakeLock();
+
+    const key = fileKey(file);
+    if (job.current?.key !== key) job.current = { key, parts: [] };
+    const current = job.current;
+
     setStatus("working");
     setError(null);
+    setResume(null);
 
     try {
       let fullTranscript: string;
+      // Resume reuses the chunks already decoded; no chunks means a direct upload.
+      let chunks = current.chunks;
 
-      if (file.size <= DIRECT_LIMIT) {
-        setProgress("Transcribing…");
-        fullTranscript = await transcribeBlob(file, file.name);
-      } else {
-        setProgress("Preparing audio (splitting into chunks)…");
-        const chunks = await chunkAudioFile(file);
-        const parts: string[] = [];
-        for (const chunk of chunks) {
-          setProgress(`Transcribing chunk ${chunk.index + 1} of ${chunks.length}…`);
-          const text = await transcribeBlob(
-            chunk.blob,
-            `${file.name}.part${chunk.index + 1}.wav`
-          );
-          parts.push(text.trim());
+      if (!chunks) {
+        // Read the length before any decode: running out of memory while
+        // decoding crashes the tab, which no catch can handle.
+        setProgress("Checking the recording's length…");
+        const durationSec = await readDuration(file);
+        if (signal.aborted) throw new DOMException("The operation was aborted.", "AbortError");
+        const ios = isIOS(navigator.userAgent, navigator.maxTouchPoints ?? 0);
+        const check = assessLongFile(durationSec, ios, isAacFile(file.name));
+        if (check.warn && !window.confirm(check.message)) {
+          setStatus("idle");
+          setProgress("");
+          return;
         }
-        fullTranscript = parts.join("\n\n");
+        if (planUpload({ size: file.size, durationSec }) === "chunked") {
+          setProgress("Preparing audio (splitting into chunks)…");
+          try {
+            // A cancel during the decode rejects here, so no chunks are kept for a
+            // job that was stopped before any upload.
+            chunks = current.chunks = await chunkAudioFile(file, signal);
+          } catch (e) {
+            // Split only for its length: if this browser can't split it, upload it whole as before.
+            if (signal.aborted || file.size > DIRECT_LIMIT) throw e;
+          }
+        }
       }
 
-      setResults((prev) => [
-        { filename: file.name, transcript: fullTranscript, at: new Date().toISOString() },
-        ...prev,
-      ]);
+      if (!chunks) {
+        setProgress("Transcribing…");
+        fullTranscript = await withRetry(
+          () => transcribeBlob(file, file.name, password, { signal }),
+          {
+            attempts: DIRECT_ATTEMPTS,
+            signal,
+            onRetry: ({ attempt, attempts }) =>
+              setProgress(`Transcribing… retrying (attempt ${attempt} of ${attempts})`),
+          }
+        );
+      } else {
+        const parts = await transcribeChunks({
+          name: file.name,
+          chunks,
+          parts: current.parts,
+          signal,
+          onProgress: setProgress,
+          upload: (chunk, filename) =>
+            withRetry(
+              () => transcribeBlob(chunk.blob, filename, password, { signal }),
+              {
+                attempts: CHUNK_ATTEMPTS,
+                signal,
+                onRetry: ({ attempt, attempts }) =>
+                  setProgress(
+                    `Transcribing chunk ${chunk.index + 1} of ${chunks.length}… retrying (attempt ${attempt} of ${attempts})`
+                  ),
+              }
+            ),
+        });
+        fullTranscript = joinTranscripts(parts);
+      }
+
+      const { partialId } = current;
+      forgetJob();
       setFile(null);
       setStatus("idle");
       setProgress("");
+      if (!fullTranscript.trim()) {
+        setError("No speech detected. Nothing was saved.");
+        return;
+      }
+      setError(null);
+      // The full transcript replaces the partial one saved by an earlier stop.
+      setResults((prev) => [
+        createResult(file.name, fullTranscript),
+        ...(partialId ? removeResult(prev, partialId) : prev),
+      ]);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong.");
+      if (e instanceof ChunkError) {
+        // Save what is done as one partial result per file, replacing the last one.
+        const text = partialTranscript(current.parts, e);
+        if (text) {
+          const partial: Result = { ...createResult(file.name, text), partial: true };
+          const previousId = current.partialId;
+          current.partialId = partial.id;
+          setResults((prev) => [partial, ...(previousId ? removeResult(prev, previousId) : prev)]);
+        }
+        setError(`${e.message} Click Resume to continue from chunk ${e.index + 1}.`);
+        setResume({ chunk: e.index + 1, total: e.total });
+      } else if (signal.aborted) {
+        setError("Cancelled. Nothing was saved.");
+      } else {
+        setError(e instanceof Error ? e.message : "Something went wrong.");
+      }
       setStatus("error");
       setProgress("");
+    } finally {
+      jobAbort.current = null;
+      releaseWakeLock();
     }
   }
 
-  async function summarize(i: number) {
-    setSummarizing(i);
+  // Matched by id throughout: the list can change while the request runs.
+  async function summarize(id: string) {
+    const target = results.find((r) => r.id === id);
+    if (!target) return;
+    setSummarizing((prev) => new Set(prev).add(id));
     try {
-      const res = await fetch("/api/summarize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ transcript: results[i].transcript }),
-      });
-      const data = await res.json();
-      if (res.status === 401) throw new Error("Access denied — check your password.");
-      if (!res.ok) throw new Error(data.error ?? "Summary failed");
-      setResults((prev) =>
-        prev.map((r, idx) => (idx === i ? { ...r, summary: data.summary as string } : r))
-      );
+      const data = await requestSummary(target.transcript, password);
+      setResults((prev) => applySummary(prev, id, data));
     } catch (e) {
       alert(e instanceof Error ? e.message : "Summary failed");
     } finally {
-      setSummarizing(null);
+      setSummarizing((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
     }
   }
 
-  function deleteResult(i: number) {
-    setResults((prev) => prev.filter((_, idx) => idx !== i));
+  function deleteResult(id: string) {
+    const target = results.find((r) => r.id === id);
+    if (!target) return;
+    if (!window.confirm(`Delete transcript "${target.filename}"? This cannot be undone.`)) return;
+    setResults((prev) => removeResult(prev, id));
+    // Not the next card's ×, so a repeated Enter cannot delete that one too.
+    transcriptsHeading.current?.focus();
   }
 
-  async function copy(text: string, i: number) {
-    await navigator.clipboard.writeText(text);
-    setCopied(i);
-    setTimeout(() => setCopied(null), 2000);
+  async function copy(id: string, text: string) {
+    let ok = true;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Permission denied, document not focused, or no clipboard over plain http.
+      ok = false;
+    }
+    setCopied({ id, ok });
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    copiedTimer.current = setTimeout(() => setCopied(null), 2000);
   }
 
   function download(r: Result) {
+    const url = URL.createObjectURL(new Blob([r.transcript], { type: "text/plain" }));
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([r.transcript], { type: "text/plain" }));
-    a.download = r.filename.replace(/\.[^.]+$/, "") + "-transcript.txt";
+    a.href = url;
+    a.download = transcriptFilename(r.filename);
+    document.body.appendChild(a);
     a.click();
+    a.remove();
+    // Revoke after a moment rather than at once, or Safari may not start the download.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  // Avoid hydration mismatch — render nothing until localStorage is loaded
-  if (password === null) return null;
+  // Avoid a hydration mismatch: render nothing until storage is loaded
+  if (!loaded) return null;
 
   return (
     <main style={{ maxWidth: 720, margin: "0 auto", padding: "48px 24px" }}>
@@ -178,15 +370,17 @@ export default function Home() {
       </div>
 
       <div style={{ marginBottom: 20 }}>
-        <label style={{ fontSize: 13, color: "#666", display: "block", marginBottom: 6 }}>
+        <label htmlFor="pw" style={{ fontSize: 13, color: "#666", display: "block", marginBottom: 6 }}>
           Access password <span style={{ color: "#444" }}>(leave blank if none is set)</span>
         </label>
         <input
+          id="pw"
           type="password"
-          value={pwInput}
+          autoComplete="current-password"
+          value={password}
           onChange={(e) => {
-            setPwInput(e.target.value);
             setPassword(e.target.value);
+            safeSet(() => sessionStorage, PW_KEY, e.target.value);
           }}
           placeholder="••••••••"
           style={{
@@ -202,45 +396,26 @@ export default function Home() {
         />
       </div>
 
-      <div
-        {...getRootProps()}
-        style={{
-          border: `2px dashed ${isDragActive ? "#4f8ef7" : "#333"}`,
-          borderRadius: 12,
-          padding: "48px 24px",
-          textAlign: "center",
-          cursor: "pointer",
-          background: isDragActive ? "rgba(79,142,247,0.05)" : "#1a1a1a",
-          transition: "all 0.2s",
-          opacity: status === "working" ? 0.5 : 1,
-        }}
-      >
-        <input {...getInputProps()} />
-        <div style={{ fontSize: 40, marginBottom: 12 }}>🎵</div>
-        <p style={{ margin: 0, color: "#ccc", fontWeight: 500 }}>
-          {isDragActive ? "Drop it here…" : "Drag & drop your audio file here"}
-        </p>
-        <p style={{ margin: "8px 0 16px", color: "#555", fontSize: 14 }}>
-          .m4a · .mp3 · .wav · .mp4 · .ogg · up to 500 MB
-        </p>
-        <button style={btn("outline")}>Browse files</button>
-      </div>
+      <DropZone onDrop={onDrop} working={status === "working"} />
 
-      {error && (
-        <div
-          style={{
-            marginTop: 16,
-            padding: "12px 16px",
-            background: "#2a1515",
-            border: "1px solid #5a2020",
-            borderRadius: 8,
-            color: "#f87171",
-            fontSize: 14,
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {/* Always rendered, so screen readers announce each new message. */}
+      <div role="alert">
+        {error && (
+          <div
+            style={{
+              marginTop: 16,
+              padding: "12px 16px",
+              background: "#2a1515",
+              border: "1px solid #5a2020",
+              borderRadius: 8,
+              color: "#f87171",
+              fontSize: 14,
+            }}
+          >
+            {error}
+          </div>
+        )}
+      </div>
 
       {file && (
         <div
@@ -262,43 +437,90 @@ export default function Home() {
             </p>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            {status !== "working" && (
+            {status === "working" ? (
               <button
-                onClick={() => setFile(null)}
+                onClick={() => {
+                  if (!jobAbort.current || jobAbort.current.signal.aborted) return;
+                  jobAbort.current.abort();
+                  // A decode in progress cannot be stopped, so say the click registered.
+                  setProgress("Cancelling…");
+                }}
+                style={btn("outline")}
+              >
+                Cancel
+              </button>
+            ) : (
+              <button
+                onClick={() => {
+                  setFile(null);
+                  forgetJob();
+                }}
+                aria-label="Remove selected file"
                 style={{ background: "none", border: "none", color: "#666", cursor: "pointer", fontSize: 18, lineHeight: 1 }}
               >
                 ×
               </button>
             )}
             <button onClick={run} disabled={status === "working"} style={btn("primary")}>
-              {status === "working" ? "Working…" : "Transcribe"}
+              {status === "working"
+                ? "Working…"
+                : resume
+                  ? `Resume (chunk ${resume.chunk} of ${resume.total})`
+                  : "Transcribe"}
             </button>
           </div>
         </div>
       )}
 
-      {status === "working" && progress && (
-        <div
-          style={{
-            marginTop: 12,
-            padding: "10px 16px",
-            background: "#15203a",
-            border: "1px solid #243a66",
-            borderRadius: 8,
-            color: "#9dc0ff",
-            fontSize: 13,
-          }}
-        >
-          {progress}
-        </div>
-      )}
+      <div role="status" aria-live="polite">
+        {status === "working" && progress && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: "10px 16px",
+              background: "#15203a",
+              border: "1px solid #243a66",
+              borderRadius: 8,
+              color: "#9dc0ff",
+              fontSize: 13,
+            }}
+          >
+            {progress}
+          </div>
+        )}
+      </div>
 
       {results.length > 0 && (
         <div style={{ marginTop: 40 }}>
-          <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>Transcripts</h2>
-          {results.map((r, i) => (
+          <h2
+            ref={transcriptsHeading}
+            tabIndex={-1}
+            style={{ fontSize: 18, fontWeight: 600, marginBottom: 4, outline: "none" }}
+          >
+            Transcripts
+          </h2>
+          <p style={{ margin: "0 0 16px", color: "#666", fontSize: 12 }}>
+            Saved only in this browser. Safari may clear it after ~7 days without a visit, so
+            download anything you want to keep.
+          </p>
+          {saveError && (
             <div
-              key={i}
+              style={{
+                marginBottom: 16,
+                padding: "12px 16px",
+                background: "#2a1515",
+                border: "1px solid #5a2020",
+                borderRadius: 8,
+                color: "#f87171",
+                fontSize: 14,
+              }}
+            >
+              {saveError}
+            </div>
+          )}
+          {results.map((r) => (
+            <div
+              key={r.id}
               style={{ marginBottom: 20, border: "1px solid #333", borderRadius: 10, overflow: "hidden" }}
             >
               <div
@@ -314,24 +536,30 @@ export default function Home() {
                   <p style={{ margin: 0, fontWeight: 500, fontSize: 14 }}>{r.filename}</p>
                   <p style={{ margin: 0, color: "#666", fontSize: 12, marginTop: 2 }}>
                     {new Date(r.at).toLocaleString()}
+                    {r.partial && " · Partial"}
                   </p>
                 </div>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                  <button onClick={() => copy(r.transcript, i)} style={btn("outline")}>
-                    {copied === i ? "✓ Copied" : "Copy"}
+                  <button onClick={() => copy(r.id, r.transcript)} style={btn("outline")}>
+                    {copied?.id === r.id
+                      ? copied.ok
+                        ? "✓ Copied"
+                        : "Copy failed. Select the text"
+                      : "Copy"}
                   </button>
                   <button onClick={() => download(r)} style={btn("outline")}>↓ .txt</button>
                   <button
-                    onClick={() => summarize(i)}
-                    disabled={summarizing === i}
+                    onClick={() => summarize(r.id)}
+                    disabled={summarizing.has(r.id) || !r.transcript.trim()}
                     style={btn("outline")}
                   >
-                    {summarizing === i ? "Summarizing…" : r.summary ? "Re-summarize" : "✦ Summarize"}
+                    {summarizing.has(r.id) ? "Summarizing…" : r.summary ? "Re-summarize" : "✦ Summarize"}
                   </button>
                   <button
-                    onClick={() => deleteResult(i)}
+                    onClick={() => deleteResult(r.id)}
                     style={{ background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "6px 4px" }}
                     title="Delete"
+                    aria-label={`Delete transcript ${r.filename}`}
                   >
                     ×
                   </button>
@@ -353,6 +581,11 @@ export default function Home() {
                   <strong style={{ display: "block", marginBottom: 6, color: "#6dbf6d", fontSize: 12, textTransform: "uppercase", letterSpacing: "0.05em" }}>
                     AI Summary
                   </strong>
+                  {r.summaryCoverage && (
+                    <span style={{ display: "block", marginBottom: 6, color: "#6b8f6b", fontSize: 12 }}>
+                      {`Covers the first ~${r.summaryCoverage.wordsUsed.toLocaleString()} of ${r.summaryCoverage.totalWords.toLocaleString()} words`}
+                    </span>
+                  )}
                   {r.summary}
                 </div>
               )}
@@ -387,32 +620,10 @@ export default function Home() {
         }}
       >
         <strong style={{ color: "#999" }}>Tip:</strong> For Spotify/podcast audio, record it with
-        Audacity (Mac: BlackHole, Windows: WASAPI loopback) and export an .mp3 — then drop it here.
-        Long files transcribe in 2-minute chunks automatically.
+        Audacity (Mac: BlackHole, Windows: WASAPI loopback) and export an .mp3, then drop it here.
+        Files over 4 MB or 10 minutes are transcribed in 2-minute chunks automatically; recordings
+        over ~1½ hours (.m4a) or ~2½ hours (.mp3) may be too long for the browser to split.
       </div>
     </main>
   );
-}
-
-function btn(variant: "primary" | "outline"): React.CSSProperties {
-  return variant === "primary"
-    ? {
-        background: "#4f8ef7",
-        color: "#fff",
-        border: "none",
-        borderRadius: 6,
-        padding: "8px 16px",
-        cursor: "pointer",
-        fontWeight: 500,
-        fontSize: 14,
-      }
-    : {
-        background: "none",
-        color: "#ccc",
-        border: "1px solid #444",
-        borderRadius: 6,
-        padding: "6px 14px",
-        cursor: "pointer",
-        fontSize: 13,
-      };
 }

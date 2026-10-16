@@ -1,63 +1,88 @@
 import { NextRequest, NextResponse } from "next/server";
+import { checkAccess } from "@/lib/server/auth";
+import { callOpenAI, errorResponse } from "@/lib/server/openai";
+import { truncateWords } from "@/lib/text";
 
 export const maxDuration = 30;
 
+// Stop waiting 5 s before the platform kills the function, so the client still gets JSON.
+// It counts from the start of the handler, since reading the body uses up time too.
+const UPSTREAM_TIMEOUT_MS = (maxDuration - 5) * 1000;
+
+// About 55 minutes of speech, at roughly $0.001 per summary. Raising it is cheap, but time a
+// long summary against maxDuration first.
+const MAX_SUMMARY_WORDS = 8000;
+
+const SYSTEM_PROMPT =
+  "You are a meeting notes assistant. Summarize the transcript concisely using this structure:\n\nKEY TOPICS:\n- ...\n\nDECISIONS / ACTION ITEMS:\n- ...\n\nPEOPLE MENTIONED:\n- ...\n\nOmit a section if nothing applies. Be direct and brief. Write plain text with no Markdown formatting.";
+
+// The parts of a chat completion the route reads. Nothing in it is trusted.
+interface ChatCompletion {
+  choices?: { message?: { content?: unknown }; finish_reason?: unknown }[];
+}
+
 export async function POST(request: NextRequest) {
+  const deadline = Date.now() + UPSTREAM_TIMEOUT_MS;
+
+  // Auth first, so anonymous callers cannot probe the server configuration.
+  const denied = checkAccess(request);
+  if (denied) return denied;
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return NextResponse.json({ error: "OPENAI_API_KEY is not set." }, { status: 500 });
+    return errorResponse(500, "missing_api_key", "OPENAI_API_KEY is not set.");
   }
 
-  const accessPassword = process.env.ACCESS_PASSWORD;
-  if (accessPassword) {
-    const provided = request.headers.get("x-access-password") ?? "";
-    if (provided !== accessPassword) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
-
-  let body: { transcript?: string };
+  let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+    return errorResponse(400, "invalid_request", "Invalid request");
   }
 
-  if (!body.transcript) {
-    return NextResponse.json({ error: "No transcript provided" }, { status: 400 });
+  const transcript =
+    typeof body === "object" && body !== null
+      ? (body as { transcript?: unknown }).transcript
+      : undefined;
+  if (typeof transcript !== "string" || !transcript.trim()) {
+    return errorResponse(400, "no_transcript", "No transcript provided");
   }
 
-  // Truncate to ~8 000 words to keep costs low (~$0.001 per summary)
-  const words = body.transcript.split(/\s+/);
-  const text =
-    words.length > 8000
-      ? words.slice(0, 8000).join(" ") + "\n\n[transcript truncated]"
-      : body.transcript;
+  const { text, truncated, wordsUsed, totalWords } = truncateWords(transcript, MAX_SUMMARY_WORDS);
+  const model = process.env.OPENAI_SUMMARY_MODEL?.trim() || "gpt-4o-mini";
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a meeting notes assistant. Summarize the transcript concisely using this structure:\n\n**Key Topics**\n- ...\n\n**Decisions / Action Items**\n- ...\n\n**People Mentioned**\n- ...\n\nOmit a section if nothing applies. Be direct and brief.",
-        },
-        { role: "user", content: text },
-      ],
-      max_tokens: 600,
-    }),
-  });
+  const result = await callOpenAI(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: text },
+        ],
+        // Newer model families reject the older output-limit parameter and require this one.
+        max_completion_tokens: 1000,
+      }),
+    },
+    { timeoutMs: Math.max(1000, deadline - Date.now()), kind: "summarize" }
+  );
+  if (!result.ok) return result.response;
 
-  if (!response.ok) {
-    const err = await response.text();
-    console.error("OpenAI summarize error:", err);
-    return NextResponse.json({ error: "Summary failed." }, { status: response.status });
+  const choice = (result.data as ChatCompletion | null)?.choices?.[0];
+  const content = choice?.message?.content;
+  if (typeof content !== "string" || !content.trim()) {
+    console.error(
+      "OpenAI summarize response has no content, finish_reason:",
+      choice?.finish_reason
+    );
+    return errorResponse(502, "empty_summary", "OpenAI returned an empty summary.");
   }
 
-  const result = await response.json();
-  const summary = result.choices?.[0]?.message?.content as string;
-  return NextResponse.json({ summary });
+  // The model hit the output cap, so say so instead of passing it off as complete.
+  const incomplete = choice?.finish_reason === "length";
+  const summary = incomplete ? content.trimEnd() + "\n\n[summary cut off]" : content;
+
+  return NextResponse.json({ summary, truncated, wordsUsed, totalWords, incomplete });
 }

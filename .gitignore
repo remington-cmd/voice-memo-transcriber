@@ -1,4 +1,12 @@
 .next/
 node_modules/
-.env.local
-.env
+.env*
+!.env.example
+.vercel
+/coverage
+*.log
+.DS_Store
+
+# TypeScript / Next.js generated
+next-env.d.ts
+*.tsbuildinfo

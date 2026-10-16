@@ -1,92 +1,76 @@
 // Browser-side audio chunking using the Web Audio API.
-// Decodes any audio file, downmixes to 16 kHz mono (what Whisper wants),
-// and splits it into fixed-length WAV chunks small enough for the 25 MB API limit.
+// Decodes any audio file straight to 16 kHz (what Whisper wants), averages it
+// to mono, and splits it into WAV chunks of at most about 2 minutes (3.84 MB).
+// Each chunk is uploaded as its own request, which must stay under Vercel's
+// 4.5 MB request body cap (see src/lib/limits.ts).
+//
+// The whole recording is held in memory while it is decoded, so a very long one
+// can crash the tab. The page reads the length first and asks before splitting
+// one that long (see assessLongFile).
 
-const TARGET_SAMPLE_RATE = 16000; // Whisper internally works at 16 kHz
-// 2 minutes per chunk. As 16 kHz mono 16-bit WAV this is ~3.8 MB, which stays
-// safely under Vercel's ~4.5 MB serverless request body limit (and Whisper's
-// 25 MB cap). Shorter chunks = more requests but reliable uploads.
-const CHUNK_SECONDS = 120;
+import { decodeFailedMessage } from "@/lib/files";
+import { TARGET_SAMPLE_RATE } from "@/lib/limits";
+import { downmixToMono, encodeWav, planChunkRanges } from "@/lib/wav";
 
 export interface AudioChunk {
   blob: Blob;
   index: number;
 }
 
-/**
- * Decode + downsample an audio file to 16 kHz mono and slice it into
- * ~5 minute WAV chunks. Returns one chunk for short files.
- */
-export async function chunkAudioFile(file: File): Promise<AudioChunk[]> {
-  const arrayBuffer = await file.arrayBuffer();
-
-  // Decode using a throwaway AudioContext
-  const AudioCtx =
-    window.AudioContext ||
-    (window as unknown as { webkitAudioContext: typeof AudioContext })
-      .webkitAudioContext;
-  const decodeCtx = new AudioCtx();
-  const decoded = await decodeCtx.decodeAudioData(arrayBuffer.slice(0));
-  await decodeCtx.close();
-
-  // Resample to 16 kHz mono via an OfflineAudioContext
-  const durationSeconds = decoded.duration;
-  const offline = new OfflineAudioContext(
-    1,
-    Math.ceil(durationSeconds * TARGET_SAMPLE_RATE),
-    TARGET_SAMPLE_RATE
-  );
-  const source = offline.createBufferSource();
-  source.buffer = decoded;
-  source.connect(offline.destination);
-  source.start(0);
-  const rendered = await offline.startRendering();
-
-  const samples = rendered.getChannelData(0);
-  const samplesPerChunk = CHUNK_SECONDS * TARGET_SAMPLE_RATE;
-  const chunks: AudioChunk[] = [];
-
-  for (let start = 0, index = 0; start < samples.length; start += samplesPerChunk, index++) {
-    const slice = samples.subarray(start, Math.min(start + samplesPerChunk, samples.length));
-    chunks.push({
-      blob: encodeWav(slice, TARGET_SAMPLE_RATE),
-      index,
-    });
-  }
-
-  return chunks;
+function throwIfAborted(signal: AbortSignal | undefined) {
+  // signal.throwIfAborted needs Safari 15.4.
+  if (signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
 }
 
-/** Encode a Float32 PCM buffer into a 16-bit mono WAV Blob. */
-function encodeWav(samples: Float32Array, sampleRate: number): Blob {
-  const buffer = new ArrayBuffer(44 + samples.length * 2);
-  const view = new DataView(buffer);
+/**
+ * Whether this browser can decode AAC at all. Chromium builds without
+ * proprietary codecs (some Linux builds) cannot; when unsure, assume it can.
+ */
+function browserDecodesAac(): boolean {
+  try {
+    return new Audio().canPlayType('audio/mp4; codecs="mp4a.40.2"') !== "";
+  } catch {
+    return true;
+  }
+}
 
-  const writeString = (offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-  };
-
-  writeString(0, "RIFF");
-  view.setUint32(4, 36 + samples.length * 2, true);
-  writeString(8, "WAVE");
-  writeString(12, "fmt ");
-  view.setUint32(16, 16, true); // PCM chunk size
-  view.setUint16(20, 1, true); // PCM format
-  view.setUint16(22, 1, true); // mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true); // byte rate
-  view.setUint16(32, 2, true); // block align
-  view.setUint16(34, 16, true); // bits per sample
-  writeString(36, "data");
-  view.setUint32(40, samples.length * 2, true);
-
-  // PCM samples
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    offset += 2;
+/**
+ * Decode an audio file to 16 kHz mono and slice it into WAV chunks of up to
+ * CHUNK_SECONDS (120 s), each cut at a quiet point where one is found (see
+ * planChunkRanges). Returns one chunk for short files.
+ *
+ * A decode cannot be interrupted, so aborting `signal` takes effect once it
+ * ends: this then rejects with an AbortError instead of encoding the chunks.
+ */
+export async function chunkAudioFile(file: File, signal?: AbortSignal): Promise<AudioChunk[]> {
+  // Safari before 14.1 only has the prefixed, callback-style API.
+  if (typeof OfflineAudioContext !== "function") {
+    throw new Error(
+      "This browser is too old to split long recordings. Use a current Chrome or Safari."
+    );
   }
 
-  return new Blob([view], { type: "audio/wav" });
+  const arrayBuffer = await file.arrayBuffer();
+  throwIfAborted(signal);
+
+  // decodeAudioData resamples to its context's rate with the decoder's
+  // band-limited resampler, so a 16 kHz offline context yields 16 kHz audio
+  // directly, whatever the output device runs at. It keeps every channel.
+  let decoded: AudioBuffer;
+  try {
+    decoded = await new OfflineAudioContext(1, 1, TARGET_SAMPLE_RATE).decodeAudioData(arrayBuffer);
+  } catch (e) {
+    // Older WebKit rejects with null rather than an Error.
+    throw new Error(decodeFailedMessage(file.name, browserDecodesAac()), { cause: e });
+  }
+  throwIfAborted(signal);
+
+  const channels: Float32Array[] = [];
+  for (let c = 0; c < decoded.numberOfChannels; c++) channels.push(decoded.getChannelData(c));
+  const samples = downmixToMono(channels);
+
+  return planChunkRanges(samples, TARGET_SAMPLE_RATE).map(([start, end], index) => ({
+    blob: encodeWav(samples.subarray(start, end), TARGET_SAMPLE_RATE),
+    index,
+  }));
 }
