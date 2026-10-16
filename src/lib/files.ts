@@ -44,17 +44,36 @@ export function rejectionMessage(rejections: readonly Rejection[]): string {
   }
 }
 
+/** A file's extension in lower case, without the dot; "" when it has none. */
+function extensionOf(filename: string): string {
+  const dot = filename.lastIndexOf(".");
+  return dot > 0 ? filename.slice(dot + 1).toLowerCase() : "";
+}
+
+/** Extensions whose audio is normally AAC, the codec iPhone voice memos use. */
+const AAC_EXTENSIONS = new Set(["m4a", "mp4", "aac"]);
+
+/** True for files whose audio is normally AAC (.m4a, .mp4, .aac). */
+export function isAacFile(filename: string): boolean {
+  return AAC_EXTENSIONS.has(extensionOf(filename));
+}
+
 /**
  * Shown when the browser can't decode a file to split it, naming its
  * extension when it has one. Current browsers all decode MP3, so a failed
- * .mp3 is most likely damaged; a failed .m4a may also be Lossless (ALAC),
- * which Chrome likely can't decode. Anything else gets the advice to convert.
+ * .mp3 is most likely damaged. A failed AAC file in a browser with no AAC
+ * decoder (`aacSupported` false, as in some Linux and Firefox builds) is the
+ * browser's fault, not the file's. Otherwise a failed .m4a may be damaged or
+ * Lossless (ALAC), which Chrome can't decode. Anything else gets the advice
+ * to convert.
  */
-export function decodeFailedMessage(filename: string): string {
-  const dot = filename.lastIndexOf(".");
-  const ext = dot > 0 ? filename.slice(dot + 1).toLowerCase() : "";
+export function decodeFailedMessage(filename: string, aacSupported = true): string {
+  const ext = extensionOf(filename);
   const what = ext && /^[a-z0-9]+$/.test(ext) ? `this .${ext} file` : "this file";
   const lead = `This browser couldn't decode ${what} for splitting.`;
+  if (!aacSupported && AAC_EXTENSIONS.has(ext)) {
+    return `${lead} It can't play AAC audio. Use a current Chrome, Edge or Safari, or convert the file to MP3.`;
+  }
   switch (ext) {
     case "mp3":
       return `${lead} It may be damaged. Try exporting it again.`;

@@ -116,9 +116,28 @@ describe("assessLongFile", () => {
     expect(assessLongFile(LONG_FILE_SOFT_SECONDS.ios + 1, false)).toEqual({ warn: false });
   });
 
+  it("asks sooner on desktop for AAC files, which cost more memory to decode", () => {
+    expect(LONG_FILE_SOFT_SECONDS.desktopAac).toBeLessThan(LONG_FILE_SOFT_SECONDS.desktop);
+    expect(assessLongFile(LONG_FILE_SOFT_SECONDS.desktopAac, false, true)).toEqual({ warn: false });
+
+    const check = assessLongFile(LONG_FILE_SOFT_SECONDS.desktopAac + 1, false, true);
+    expect(check.warn).toBe(true);
+    if (!check.warn) return;
+    expect(check.message).toContain("1 h 31 min long");
+    expect(check.message).toContain("over 1 h 30 min in the browser");
+    // The same length as an MP3 is still under the desktop limit.
+    expect(assessLongFile(LONG_FILE_SOFT_SECONDS.desktopAac + 1, false)).toEqual({ warn: false });
+  });
+
+  it("keeps the iOS limit for AAC files", () => {
+    expect(assessLongFile(LONG_FILE_SOFT_SECONDS.ios, true, true)).toEqual({ warn: false });
+    expect(assessLongFile(LONG_FILE_SOFT_SECONDS.ios + 1, true, true).warn).toBe(true);
+  });
+
   it("does not ask when the length is unknown", () => {
     expect(assessLongFile(null, false)).toEqual({ warn: false });
     expect(assessLongFile(null, true)).toEqual({ warn: false });
+    expect(assessLongFile(null, false, true)).toEqual({ warn: false });
   });
 
   it("uses no em-dashes in the message", () => {

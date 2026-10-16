@@ -23,6 +23,18 @@ function throwIfAborted(signal: AbortSignal | undefined) {
 }
 
 /**
+ * Whether this browser can decode AAC at all. Chromium builds without
+ * proprietary codecs (some Linux builds) cannot; when unsure, assume it can.
+ */
+function browserDecodesAac(): boolean {
+  try {
+    return new Audio().canPlayType('audio/mp4; codecs="mp4a.40.2"') !== "";
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Decode an audio file to 16 kHz mono and slice it into WAV chunks of up to
  * CHUNK_SECONDS (120 s), each cut at a quiet point where one is found (see
  * planChunkRanges). Returns one chunk for short files.
@@ -49,7 +61,7 @@ export async function chunkAudioFile(file: File, signal?: AbortSignal): Promise<
     decoded = await new OfflineAudioContext(1, 1, TARGET_SAMPLE_RATE).decodeAudioData(arrayBuffer);
   } catch (e) {
     // Older WebKit rejects with null rather than an Error.
-    throw new Error(decodeFailedMessage(file.name), { cause: e });
+    throw new Error(decodeFailedMessage(file.name, browserDecodesAac()), { cause: e });
   }
   throwIfAborted(signal);
 

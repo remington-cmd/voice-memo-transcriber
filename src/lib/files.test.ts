@@ -4,6 +4,7 @@ import {
   ACCEPTED_EXTENSIONS,
   MAX_SIZE_LABEL,
   decodeFailedMessage,
+  isAacFile,
   rejectionMessage,
 } from "./files";
 
@@ -96,9 +97,40 @@ describe("decodeFailedMessage", () => {
     }
   });
 
+  it("blames the browser, not the file, when it has no AAC decoder", () => {
+    for (const name of ["New Recording.m4a", "clip.MP4", "memo.aac"]) {
+      const message = decodeFailedMessage(name, false);
+      expect(message).toContain("It can't play AAC audio.");
+      expect(message).toContain("Use a current Chrome, Edge or Safari, or convert the file to MP3.");
+      expect(message).not.toContain("damaged");
+    }
+    // With an AAC decoder present, a failed .m4a keeps the damaged/Lossless advice.
+    expect(decodeFailedMessage("New Recording.m4a", true)).toContain("recorded as Lossless");
+  });
+
+  it("ignores missing AAC support for files that are not AAC", () => {
+    expect(decodeFailedMessage("memo.mp3", false)).toBe(decodeFailedMessage("memo.mp3"));
+    expect(decodeFailedMessage("memo.ogg", false)).toBe(decodeFailedMessage("memo.ogg"));
+  });
+
   it("uses no em-dashes", () => {
     for (const name of ["a.mp3", "a.m4a", "a.ogg", "a"]) {
       expect(decodeFailedMessage(name)).not.toContain("—");
+      expect(decodeFailedMessage(name, false)).not.toContain("—");
+    }
+  });
+});
+
+describe("isAacFile", () => {
+  it("recognises AAC extensions in any case", () => {
+    for (const name of ["New Recording.m4a", "MEMO.M4A", "clip.mp4", "memo.aac"]) {
+      expect(isAacFile(name)).toBe(true);
+    }
+  });
+
+  it("rejects other formats and names without an extension", () => {
+    for (const name of ["memo.mp3", "memo.wav", "memo.ogg", "memo.webm", "memo", ".m4a", "m4a"]) {
+      expect(isAacFile(name)).toBe(false);
     }
   });
 });

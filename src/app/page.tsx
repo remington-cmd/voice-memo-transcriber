@@ -6,7 +6,7 @@ import { chunkAudioFile, type AudioChunk } from "./audio-chunker";
 import { DropZone } from "./drop-zone";
 import { btn } from "./styles";
 import { requestSummary, transcribeBlob } from "@/lib/api-client";
-import { rejectionMessage } from "@/lib/files";
+import { isAacFile, rejectionMessage } from "@/lib/files";
 import { assessLongFile, DIRECT_LIMIT, isIOS, planUpload } from "@/lib/limits";
 import { readDuration } from "@/lib/media";
 import { ChunkError, partialTranscript, transcribeChunks } from "@/lib/pipeline";
@@ -211,7 +211,7 @@ export default function Home() {
         const durationSec = await readDuration(file);
         if (signal.aborted) throw new DOMException("The operation was aborted.", "AbortError");
         const ios = isIOS(navigator.userAgent, navigator.maxTouchPoints ?? 0);
-        const check = assessLongFile(durationSec, ios);
+        const check = assessLongFile(durationSec, ios, isAacFile(file.name));
         if (check.warn && !window.confirm(check.message)) {
           setStatus("idle");
           setProgress("");
@@ -622,7 +622,7 @@ export default function Home() {
         <strong style={{ color: "#999" }}>Tip:</strong> For Spotify/podcast audio, record it with
         Audacity (Mac: BlackHole, Windows: WASAPI loopback) and export an .mp3, then drop it here.
         Files over 4 MB or 10 minutes are transcribed in 2-minute chunks automatically; recordings
-        over ~2½ hours may be too long for the browser to split.
+        over ~1½ hours (.m4a) or ~2½ hours (.mp3) may be too long for the browser to split.
       </div>
     </main>
   );

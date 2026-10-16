@@ -46,10 +46,12 @@ export const DIRECT_MAX_SECONDS = 600;
  * Lengths above which splitting in the browser may run out of memory and crash
  * the tab, which no error handler can catch. The whole recording is decoded in
  * memory at once: in Chromium that peaked at about 1.7 GB for an hour of mono
- * audio and 8 GB for a 3 h stereo MP3. iOS gives a tab far less; its figure is
- * an estimate, not measured.
+ * MP3 and 8 GB for a 3 h stereo MP3. AAC (.m4a, the iPhone format) costs more
+ * to decode: Chrome 155 measured about 2.1 GB per hour of mono AAC and 4.1 GB
+ * per hour of stereo, so it gets a lower desktop limit. iOS gives a tab far
+ * less; its figure is an estimate, not measured.
  */
-export const LONG_FILE_SOFT_SECONDS = { desktop: 9000, ios: 3600 } as const;
+export const LONG_FILE_SOFT_SECONDS = { desktop: 9000, desktopAac: 5400, ios: 3600 } as const;
 
 export type UploadPlan = "direct" | "chunked";
 
@@ -83,9 +85,18 @@ export type LongFileCheck = { warn: false } | { warn: true; message: string };
 /**
  * Whether to ask before splitting a recording this long, and what to ask.
  * Nothing is asked at or under the soft limit, or when the length is unknown.
+ * `aac` selects the lower desktop limit for AAC files (see isAacFile).
  */
-export function assessLongFile(durationSec: number | null, ios: boolean): LongFileCheck {
-  const limit = ios ? LONG_FILE_SOFT_SECONDS.ios : LONG_FILE_SOFT_SECONDS.desktop;
+export function assessLongFile(
+  durationSec: number | null,
+  ios: boolean,
+  aac = false
+): LongFileCheck {
+  const limit = ios
+    ? LONG_FILE_SOFT_SECONDS.ios
+    : aac
+      ? LONG_FILE_SOFT_SECONDS.desktopAac
+      : LONG_FILE_SOFT_SECONDS.desktop;
   if (durationSec === null || durationSec <= limit) return { warn: false };
   const where = ios ? "on an iPhone or iPad" : "in the browser";
   return {
