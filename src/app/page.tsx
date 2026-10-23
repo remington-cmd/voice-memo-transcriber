@@ -147,7 +147,7 @@ export default function Home() {
         const known = new Set(prev.map((r) => r.id));
         return [...remote.filter((r) => !known.has(r.id)), ...prev];
       });
-      setCloudNotice(`Loaded ${remote.length} records. Older pages can be retrieved through MCP.`);
+      setCloudNotice(`Loaded ${remote.length} records. Other pages can be retrieved through MCP.`);
     } catch (error) {
       setCloudNotice(error instanceof Error ? error.message : "Could not load cloud records.");
     } finally {
