@@ -286,7 +286,7 @@ export default function Home() {
 
       <div style={{ marginBottom: 20 }}>
         <label style={{ fontSize: 13, color: "#666", display: "block", marginBottom: 6 }}>
-          Access password <span style={{ color: "#444" }}>(leave blank if none is set)</span>
+          Access password <span style={{ color: "#444" }}>(required)</span>
         </label>
         <input
           type="password"
