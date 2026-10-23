@@ -92,6 +92,7 @@ export async function listTranscripts(options: { limit: number; cursor?: string 
       hasSummary: !!record.summary,
     });
   }
+  items.sort((a, b) => b.at.localeCompare(a.at)); // Page-local order only.
   return { items, nextCursor: hasMore ? cursor ?? null : null };
 }
 
