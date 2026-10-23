@@ -9,6 +9,8 @@ const MAX_SIZE = 500 * 1024 * 1024;
 const LS_KEY = "vmt_results";
 
 interface Result {
+  id?: string;
+  synced?: boolean;
   filename: string;
   transcript: string;
   at: string; // ISO string for serialization
@@ -27,6 +29,9 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<number | null>(null);
   const [summarizing, setSummarizing] = useState<number | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [loadingCloud, setLoadingCloud] = useState(false);
+  const [cloudNotice, setCloudNotice] = useState<string | null>(null);
 
   // Load password from sessionStorage and transcripts from localStorage on mount
   useEffect(() => {
@@ -35,7 +40,12 @@ export default function Home() {
     setPwInput(savedPw);
     try {
       const saved = localStorage.getItem(LS_KEY);
-      if (saved) setResults(JSON.parse(saved));
+      if (saved) {
+        const stored = JSON.parse(saved) as Result[];
+        if (Array.isArray(stored)) {
+          setResults(stored.map((r) => ({ ...r, id: r.id || crypto.randomUUID() })));
+        }
+      }
     } catch {}
   }, []);
 
@@ -86,6 +96,65 @@ export default function Home() {
     return data.transcript as string;
   }
 
+  // No browser transcript gets removed if cloud storage is unavailable.
+  async function saveCloudResult(result: Result) {
+    const response = await fetch("/api/transcripts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(result),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error ?? "Cloud save failed");
+  }
+
+  // Explicit user action to migrate existing browser-only transcripts.
+  async function syncLocal() {
+    setSyncing(true);
+    let saved = 0;
+    try {
+      for (const item of results.filter((r) => !r.synced)) {
+        const normalized = { ...item, id: item.id || crypto.randomUUID() };
+        await saveCloudResult(normalized);
+        setResults((prev) => prev.map((r) =>
+          r.id === item.id ? { ...r, id: normalized.id, synced: true } : r
+        ));
+        saved++;
+      }
+      setCloudNotice(saved ? `Synced ${saved} transcript(s) to private storage.` : "Nothing new to sync.");
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "Cloud storage unavailable.";
+      setCloudNotice(`Synced ${saved}; remaining transcripts are only in this browser. ${reason}`);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function loadCloud() {
+    setLoadingCloud(true);
+    try {
+      const response = await fetch("/api/transcripts?limit=25", { headers: authHeaders() });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? "Cloud listing failed");
+      const remote: Result[] = [];
+      for (const item of data.items as { id: string }[]) {
+        const detail = await fetch(`/api/transcripts/${encodeURIComponent(item.id)}`, {
+          headers: authHeaders(),
+        });
+        if (!detail.ok) throw new Error("A stored transcript could not be retrieved.");
+        remote.push({ ...(await detail.json()), synced: true });
+      }
+      setResults((prev) => {
+        const known = new Set(prev.map((r) => r.id));
+        return [...remote.filter((r) => !known.has(r.id)), ...prev];
+      });
+      setCloudNotice(`Loaded ${remote.length} records. Other pages can be retrieved through MCP.`);
+    } catch (error) {
+      setCloudNotice(error instanceof Error ? error.message : "Could not load cloud records.");
+    } finally {
+      setLoadingCloud(false);
+    }
+  }
+
   async function run() {
     if (!file) return;
     sessionStorage.setItem("vmt_pw", password ?? "");
@@ -113,13 +182,27 @@ export default function Home() {
         fullTranscript = parts.join("\n\n");
       }
 
-      setResults((prev) => [
-        { filename: file.name, transcript: fullTranscript, at: new Date().toISOString() },
-        ...prev,
-      ]);
+      const record: Result = {
+        id: crypto.randomUUID(),
+        filename: file.name,
+        transcript: fullTranscript,
+        at: new Date().toISOString(),
+        synced: false,
+      };
+      setResults((prev) => [record, ...prev]);
       setFile(null);
       setStatus("idle");
       setProgress("");
+      try {
+        await saveCloudResult(record);
+        setResults((prev) => prev.map((r) =>
+          r.id === record.id ? { ...r, synced: true } : r
+        ));
+        setCloudNotice(null);
+      } catch (cloudError) {
+        setCloudNotice("Transcript saved on this browser only. " +
+          (cloudError instanceof Error ? cloudError.message : "Cloud storage unavailable."));
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong.");
       setStatus("error");
@@ -141,6 +224,16 @@ export default function Home() {
       setResults((prev) =>
         prev.map((r, idx) => (idx === i ? { ...r, summary: data.summary as string } : r))
       );
+      if (results[i].synced && results[i].id) {
+        const response = await fetch(`/api/transcripts/${encodeURIComponent(results[i].id)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ summary: data.summary }),
+        });
+        if (!response.ok) {
+          setCloudNotice("Summary saved in browser, but cloud summary update failed.");
+        }
+      }
     } catch (e) {
       alert(e instanceof Error ? e.message : "Summary failed");
     } finally {
@@ -148,8 +241,22 @@ export default function Home() {
     }
   }
 
-  function deleteResult(i: number) {
-    setResults((prev) => prev.filter((_, idx) => idx !== i));
+  async function deleteResult(i: number) {
+    const record = results[i];
+    if (record.synced && record.id) {
+      if (!window.confirm("Delete from private cloud storage AND this browser?")) return;
+      try {
+        const response = await fetch(`/api/transcripts/${encodeURIComponent(record.id)}`, {
+          method: "DELETE",
+          headers: authHeaders(),
+        });
+        if (!response.ok) throw new Error("Could not delete the cloud record.");
+      } catch {
+        setCloudNotice("Cloud deletion failed; the transcript remains in this browser.");
+        return;
+      }
+    }
+    setResults((prev) => prev.filter((r) => r.id !== record.id));
   }
 
   async function copy(text: string, i: number) {
@@ -179,7 +286,7 @@ export default function Home() {
 
       <div style={{ marginBottom: 20 }}>
         <label style={{ fontSize: 13, color: "#666", display: "block", marginBottom: 6 }}>
-          Access password <span style={{ color: "#444" }}>(leave blank if none is set)</span>
+          Access password <span style={{ color: "#444" }}>(required)</span>
         </label>
         <input
           type="password"
@@ -290,6 +397,20 @@ export default function Home() {
           }}
         >
           {progress}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8, marginTop: 24, flexWrap: "wrap" }}>
+        <button onClick={syncLocal} disabled={syncing || status === "working"} style={btn("outline")}>
+          {syncing ? "Syncing…" : "Sync local transcripts"}
+        </button>
+        <button onClick={loadCloud} disabled={loadingCloud || status === "working"} style={btn("outline")}>
+          {loadingCloud ? "Loading…" : "Load cloud transcripts"}
+        </button>
+      </div>
+      {cloudNotice && (
+        <div role="status" style={{ marginTop: 12, color: "#e5bb69", fontSize: 13 }}>
+          {cloudNotice}
         </div>
       )}
 

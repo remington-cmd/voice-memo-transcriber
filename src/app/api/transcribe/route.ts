@@ -1,22 +1,23 @@
+import { isBrowserAuthorized } from "@/lib/api-auth";
 import { NextRequest, NextResponse } from "next/server";
 
 export const maxDuration = 60;
 
 export async function POST(request: NextRequest) {
+  // Fail closed: the public site must not expose paid model APIs without authentication.
+  if (!process.env.ACCESS_PASSWORD) {
+    return NextResponse.json({ error: "Access password is not configured." }, { status: 503 });
+  }
+  if (!isBrowserAuthorized(request.headers)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
       { error: "OPENAI_API_KEY is not set. Add it to your environment variables." },
       { status: 500 }
     );
-  }
-
-  const accessPassword = process.env.ACCESS_PASSWORD;
-  if (accessPassword) {
-    const provided = request.headers.get("x-access-password") ?? "";
-    if (provided !== accessPassword) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
   }
 
   let formData: FormData;
