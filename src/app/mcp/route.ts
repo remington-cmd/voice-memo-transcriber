@@ -12,7 +12,7 @@ const handler = createMcpHandler((server) => {
     "list_transcripts",
     {
       title: "List saved transcripts",
-      description: "List privately stored voice memo transcripts, newest uploads first as supplied by storage. Returns transcript ids for get_transcript and a cursor for pagination. Never invent records.",
+      description: "List one page of privately stored transcripts. Returns ids for get_transcript and a cursor for pagination. Order is not guaranteed across pages. Never invent records.",
       inputSchema: z.object({
         limit: z.number().int().min(1).max(25).default(10),
         cursor: z.string().max(2000).optional(),
