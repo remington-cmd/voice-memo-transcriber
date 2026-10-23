@@ -29,7 +29,7 @@ Call `list_transcripts`, then `get_transcript` by id. Follow `nextOffset` until 
 
 ## Guardrails and verification
 
-- The new private REST and MCP routes fail closed if any required credentials are missing. Existing transcription/summarization APIs retain their legacy optional password behavior, so **set ACCESS_PASSWORD before merge** to avoid public transcription spend.
+- The new private REST and MCP routes fail closed if any required credentials are missing. The paid transcription/summarization APIs also fail closed without ACCESS_PASSWORD. **Configure ACCESS_PASSWORD before merge**, or the browser will correctly return 503 instead of making unauthenticated API calls.
 - Audio chunking in the browser and the existing Whisper transcription endpoint are unchanged; MCP is currently **read-only** and does not download Spotify embeds.
 - When a synced transcript is deleted in the web UI, private-cloud deletion must also succeed before removing the local record.
 - Review retention, audit logs and jurisdiction before processing confidential third-party content.
